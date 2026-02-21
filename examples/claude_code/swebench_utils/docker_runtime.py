@@ -149,8 +149,8 @@ class CommandResult:
 
         output = ANSI_ESCAPE.sub("", self.output).replace("\r", "")
 
-        if len(output) > 1024 * 8 and strip:
-            output = output[: 1024 * 4] + "....stripped due to length....\n" + output[-1024 * 4 :]
+        # if len(output) > 1024 * 8 and strip:
+        #     output = output[: 1024 * 4] + "....stripped due to length....\n" + output[-1024 * 4 :]
 
         if self.metadata is None:
             return f"\n{output}\n"
@@ -284,11 +284,11 @@ class Runtime:
 
     def _log_command_result(self, result: CommandResult) -> None:
         claude_code_logger.debug("Docker runtime command finished with metadata: %s", result.metadata)
-        if len(result.output) > 2048:
-            logged_output = result.output[:1024] + "\n(... stripped due to length ...)\n" + result.output[-1024:]
-        else:
-            logged_output = result.output
-        # logged_output = result.output
+        # if len(result.output) > 2048:
+        #     logged_output = result.output[:1024] + "\n(... stripped due to length ...)\n" + result.output[-1024:]
+        # else:
+        #     logged_output = result.output
+        logged_output = result.output
         claude_code_logger.debug(
             "Docker runtime command finished with output (length = %d):\n%s", len(result.output), logged_output
         )

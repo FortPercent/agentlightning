@@ -40,6 +40,11 @@ Please do not commit your edits. We will do it later.
 
 logger = logging.getLogger("claude_code_agent")
 
+import json
+import re
+import requests
+from typing import Literal, TypedDict, Any, Dict, List, Optional
+
 
 class RunInstanceResult(TypedDict):
     instance_id: str
@@ -136,6 +141,342 @@ class ClaudeController:
         self.container.send_command(claude_cmd, time_limit * 60)
         logger.info(f"Claude Code CLI command completed")
     
+    def _build_tools_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_bash",
+                    "description": "Run shell command in sandbox container",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                            "timeout": {"type": "integer"},
+                        },
+                        "required": ["cmd"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read UTF-8 text file content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "max_bytes": {"type": "integer"},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write UTF-8 text file content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "append": {"type": "boolean"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "description": "Apply unified diff patch in /testbed",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "patch": {"type": "string"},
+                            "strip": {"type": "integer"},
+                        },
+                        "required": ["patch"],
+                    },
+                },
+            },
+        ]
+
+    def _exec_container_tool(self, name: str, args: Dict[str, Any], time_limit: int) -> str:
+        """Execute one tool in container and return JSON string."""
+        def _ok(content: str, **meta: Any) -> str:
+            return json.dumps({"ok": True, "content": content, "metadata": meta}, ensure_ascii=False)
+
+        def _err(content: str, **meta: Any) -> str:
+            return json.dumps({"ok": False, "content": content, "metadata": meta}, ensure_ascii=False)
+
+        try:
+            timeout_default = min(120, time_limit * 60)
+
+            if name == "run_bash":
+                cmd = args["cmd"]
+                timeout = int(args.get("timeout", timeout_default))
+                blocked = ["rm -rf /", ":(){:|:&};:", "shutdown", "reboot"]
+                if any(x in cmd.lower() for x in blocked):
+                    return _err(f"Blocked command: {cmd}", tool=name)
+                full = f"cd /testbed && {cmd}"
+                out = self.container.send_command(full, timeout)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, cmd=full, timeout=timeout)
+
+            if name == "read_file":
+                path = args["path"]
+                max_bytes = int(args.get("max_bytes", 60000))
+                py = (
+                    "import os\n"
+                    f"p={path!r}\n"
+                    "if not os.path.isabs(p): p=os.path.join('/testbed', p)\n"
+                    f"b=open(p,'rb').read({max_bytes})\n"
+                    "print(b.decode('utf-8', errors='replace'))\n"
+                )
+                cmd = f"cd /testbed && python - <<'PY'\n{py}PY"
+                out = self.container.send_command(cmd, timeout_default)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, path=path, max_bytes=max_bytes)
+
+            if name == "write_file":
+                path = args["path"]
+                content = args["content"]
+                append = bool(args.get("append", False))
+                mode = "a" if append else "w"
+                py = (
+                    "import os\n"
+                    f"p={path!r}\n"
+                    "if not os.path.isabs(p): p=os.path.join('/testbed', p)\n"
+                    "os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+                    f"open(p,{mode!r},encoding='utf-8').write({content!r})\n"
+                    "print('OK')\n"
+                )
+                cmd = f"cd /testbed && python - <<'PY'\n{py}PY"
+                out = self.container.send_command(cmd, timeout_default)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, path=path, append=append)
+
+            if name == "apply_patch":
+                patch = args["patch"]
+                strip = int(args.get("strip", 0))
+                cmd = (
+                    "cd /testbed && "
+                    "cat > /tmp/agent.patch <<'PATCH'\n"
+                    f"{patch}\n"
+                    "PATCH\n"
+                    f"(git apply -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
+                )
+                out = self.container.send_command(cmd, timeout_default)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, strip=strip)
+
+            return _err(f"Unknown tool: {name}", tool=name, args=args)
+
+        except Exception as e:
+            return _err(f"{type(e).__name__}: {e}", tool=name, args=args)
+
+    def _run_openai_tools(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> str:
+        """
+        Multi-turn tool loop tailored for Qwen XML-style tool calling.
+        Matches the tokenizer_config.json chat_template logic.
+        """
+        prompt_text = SWEBENCH_USER_PROMPT.format(
+            description=instance["problem_statement"].replace('"""', "'''")
+        )
+
+        system_prompt = (
+            SWEBENCH_EXTRA_SYSTEM_PROMPT
+            + "\n\nYou are a code-fixing agent with tools in sandbox."
+            + "\nRules:"
+            + "\n1) If info is missing, call tools first."
+            + "\n2) Do NOT provide only high-level suggestions."
+            + "\n3) For code changes, use apply_patch/write_file with exact content."
+            + "\n4) Before final answer, run validation commands via tools."
+            + "\n5) Final answer must include changed files and exact patch summary."
+        )
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_text},
+        ]
+
+        url = f"{self.endpoint}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if getattr(self, "api_key", None):
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        tools = self._build_tools_schema()
+        final_text = ""
+        
+        # Ensure model name matches your deployment
+        model_name = "claude-sonnet-4-5-20250929" 
+
+        def _extract_content_text(content: Any) -> str:
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                # Handle multi-modal content blocks if necessary
+                return "".join([x.get("text", "") for x in content if x.get("type") == "text"])
+            return str(content) if content else ""
+
+        def _parse_qwen_xml_tool_calls(content: str) -> List[Dict[str, Any]]:
+            """
+            Parses Qwen specific XML format:
+            <tool_call>
+            <function=func_name>
+            <parameter=param_name>value</parameter>
+            </function>
+            </tool_call>
+            """
+            tool_calls = []
+            # 1. Find all <tool_call> blocks
+            # Use DOTALL to match across newlines
+            tool_call_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+            
+            # 2. Inside tool_call, find function name
+            func_name_pattern = re.compile(r"<function=(.*?)>", re.DOTALL)
+            
+            # 3. Find parameters
+            # Note: Value might be multi-line
+            param_pattern = re.compile(r"<parameter=(.*?)>(.*?)</parameter>", re.DOTALL)
+
+            for match in tool_call_pattern.finditer(content):
+                block = match.group(1)
+                
+                # Extract function name
+                fn_match = func_name_pattern.search(block)
+                if not fn_match:
+                    continue
+                func_name = fn_match.group(1).strip()
+                
+                # Extract arguments
+                arguments = {}
+                for p_match in param_pattern.finditer(block):
+                    key = p_match.group(1).strip()
+                    val = p_match.group(2) # Do not strip blindly, value might be code with indentation
+                    # Try to unescape or clean generic JSON artifacts if strictly needed, 
+                    # but usually Qwen outputs raw text in the XML.
+                    arguments[key] = val
+
+                tool_calls.append({
+                    "id": f"call_{len(tool_calls)}_{func_name}", # Synthetic ID
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        # IMPORTANT: Store as Dict for the Jinja template to iterate with |items
+                        "arguments": arguments 
+                    }
+                })
+            return tool_calls
+
+        # Pre-flight check
+        try:
+            self.container.send_command("cd /testbed && git config --global --add safe.directory /testbed", timeout=10)
+        except Exception:
+            pass
+
+        for turn in range(max_turns):
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "temperature": 0.0, # Zero temp for deterministic tool usage
+                "max_tokens": 4096,
+                "stop": ["<|im_end|>", "<|endoftext|>"]
+            }
+
+            logger.info(f"[tool-loop] turn={turn+1} invoking model...")
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=time_limit * 60)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.error(f"API Request failed: {e}")
+                break
+
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            content_raw = msg.get("content", "")
+            content_text = _extract_content_text(content_raw)
+            
+            # 1. Try native parsing first (if vLLM/Server supports Qwen tool parsing)
+            tool_calls = msg.get("tool_calls") or []
+            
+            # 2. Fallback to XML parsing if native calls are empty but text contains XML
+            if not tool_calls and "<tool_call>" in content_text:
+                tool_calls = _parse_qwen_xml_tool_calls(content_text)
+
+            logger.info(f"[tool-loop] turn={turn+1} content_len={len(content_text)} tool_calls={len(tool_calls)}")
+
+            # CASE A: No tool calls -> This is the final answer or a chat response
+            if not tool_calls:
+                final_text = content_text
+                messages.append({"role": "assistant", "content": final_text})
+                
+                # --- Heuristic Check: Did it actually do anything? ---
+                if "run_validation" not in final_text and turn < 2:
+                     # Optional: Force it to continue if it quit too early
+                     pass 
+                break
+
+            # CASE B: Tool calls detected
+            # Add assistant message to history. 
+            # CRITICAL: 'arguments' must be Dict to match your jinja template {% for k,v in args|items %}
+            # If native API returned JSON string args, parse them to Dict.
+            sanitized_tool_calls = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        args = {} # Fail safe
+                
+                sanitized_tool_calls.append({
+                    "id": tc.get("id", "sf"),
+                    "type": "function",
+                    "function": {
+                        "name": fn.get("name"),
+                        "arguments": args # Ensure Dict
+                    }
+                })
+
+            messages.append({
+                "role": "assistant",
+                "content": content_text, # Keep thought process
+                "tool_calls": sanitized_tool_calls
+            })
+
+            # Execute Tools
+            for tc in sanitized_tool_calls:
+                fn_name = tc["function"]["name"]
+                fn_args = tc["function"]["arguments"]
+                tcid = tc["id"]
+
+                logger.info(f"[tool-loop] Executing {fn_name} args={fn_args}")
+                
+                # Execute inside Docker
+                result_str = self._exec_container_tool(fn_name, fn_args, time_limit=time_limit)
+
+                # Format Observation
+                # The Jinja template handles role="tool" by wrapping in <tool_response>
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tcid,
+                    "name": fn_name,
+                    "content": result_str
+                })
+
+        return final_text
+
+
     # _run_openai
     def _run_openai(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> None:
         """
@@ -272,7 +613,7 @@ fi
         instance: SWEbenchInstance,
         max_turns: int = 40,
         time_limit: int = 30,
-        run_method: Literal["python", "cli"] = "python",
+        run_method: Literal["python", "cli", "openai_tools"] = "openai_tools",
     ) -> RunInstanceResult:
         """Runs the agent on a specific SWE-bench instance.
 
@@ -295,12 +636,16 @@ fi
         Raises:
             ValueError: If `run_method` is not "python" or "cli".
         """
+        print(f"===run_method: {run_method}=====")
+        # exit()
         if run_method == "python":
             logger.warning("Running Claude Code using Python SDK is still under development and not yet stable.")
             self._run_python_sdk(instance, max_turns, time_limit)
         elif run_method == "cli":
             # self._run_cli(instance, max_turns, time_limit)
             self._run_openai(instance, max_turns, time_limit)
+        elif run_method == "openai_tools":
+            self._run_openai_tools(instance, max_turns, time_limit)            
         else:
             raise ValueError(f"Wrong run_method '{run_method}', run_method should be in ['python', 'cli']")
 

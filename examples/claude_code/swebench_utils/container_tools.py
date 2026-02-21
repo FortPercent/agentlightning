@@ -1,247 +1,179 @@
-# container_tools.py
+# agent_runtime/container_tools.py
 from __future__ import annotations
-
 import json
 import shlex
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Callable
+from typing import Any, Dict, Callable
 
 
 @dataclass
 class ToolResult:
     ok: bool
-    tool: str
-    result: str = ""
-    error: str = ""
-    exit_code: Optional[int] = None
-    latency_sec: float = 0.0
-    finished: bool = False
-    summary: str = ""
+    content: str
+    metadata: Dict[str, Any] | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"ok": self.ok, "content": self.content, "metadata": self.metadata or {}},
+            ensure_ascii=False
+        )
 
 
 class ContainerTools:
     """
-    A white-box tool executor for container operations.
-
-    Expected container interface:
-        container.send_command(cmd: str, timeout_sec: int | None = None) -> Any
+    container 需要提供:
+      send_command(cmd: str, timeout: int | None = None) -> str 或对象(含output字段)
     """
-
-    def __init__(
-        self,
-        container: Any,
-        workspace_root: str = ".",
-        max_output_chars: int = 30000,
-        logger: Optional[Callable[[str], None]] = None,
-    ) -> None:
+    def __init__(self, container: Any, workdir: str = "/testbed", default_timeout: int = 120):
         self.container = container
-        self.workspace_root = workspace_root
-        self.max_output_chars = max_output_chars
-        self.logger = logger
+        self.workdir = workdir
+        self.default_timeout = default_timeout
 
-    # ---------- public ----------
+        self._dispatch: Dict[str, Callable[[Dict[str, Any]], ToolResult]] = {
+            "run_bash": self.run_bash,
+            "read_file": self.read_file,
+            "write_file": self.write_file,
+            "apply_patch": self.apply_patch,
+        }
+
     @staticmethod
-    def tool_specs() -> list[dict]:
-        """Tool schemas for model prompting / function-calling style."""
+    def openai_tools_schema() -> list[dict]:
         return [
             {
-                "name": "run_shell",
-                "description": "Run a shell command inside container.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cmd": {"type": "string"},
-                        "timeout_sec": {"type": "integer", "default": 120},
-                    },
-                    "required": ["cmd"],
-                },
+                "type": "function",
+                "function": {
+                    "name": "run_bash",
+                    "description": "Run shell command in sandbox container",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                            "timeout": {"type": "integer"}
+                        },
+                        "required": ["cmd"]
+                    }
+                }
             },
             {
-                "name": "read_file",
-                "description": "Read file text content.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "max_chars": {"type": "integer", "default": 12000},
-                    },
-                    "required": ["path"],
-                },
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read UTF-8 text file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "max_bytes": {"type": "integer"}
+                        },
+                        "required": ["path"]
+                    }
+                }
             },
             {
-                "name": "write_file",
-                "description": "Write full content to file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
-                    },
-                    "required": ["path", "content"],
-                },
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write UTF-8 text to file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "append": {"type": "boolean"}
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
             },
             {
-                "name": "apply_patch",
-                "description": "Apply unified diff patch with apply_patch helper.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "patch": {"type": "string"},
-                    },
-                    "required": ["patch"],
-                },
-            },
-            {
-                "name": "run_tests",
-                "description": "Run tests or script command for verification.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "test_cmd": {"type": "string"},
-                        "timeout_sec": {"type": "integer", "default": 600},
-                    },
-                    "required": ["test_cmd"],
-                },
-            },
-            {
-                "name": "finish",
-                "description": "Finish the task with a concise summary.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "summary": {"type": "string"},
-                    },
-                    "required": ["summary"],
-                },
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "description": "Apply unified diff patch",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "patch": {"type": "string"},
+                            "strip": {"type": "integer"}
+                        },
+                        "required": ["patch"]
+                    }
+                }
             },
         ]
 
-    def execute(self, name: str, arguments: Dict[str, Any]) -> ToolResult:
-        """Main dispatcher."""
-        start = time.time()
+    def execute(self, name: str, args: Dict[str, Any]) -> ToolResult:
+        if name not in self._dispatch:
+            return ToolResult(False, f"Unknown tool: {name}", {"tool": name, "args": args})
         try:
-            if name == "run_shell":
-                cmd = str(arguments["cmd"])
-                timeout_sec = int(arguments.get("timeout_sec", 120))
-                out = self._send(cmd, timeout_sec)
-                return self._ok(name, out, latency=time.time() - start)
-
-            if name == "read_file":
-                path = str(arguments["path"])
-                max_chars = int(arguments.get("max_chars", 12000))
-                self._ensure_safe_path(path)
-                cmd = (
-                    "python - <<'PY'\n"
-                    "from pathlib import Path\n"
-                    f"p = Path({path!r})\n"
-                    "if not p.exists():\n"
-                    "    print('[ERROR] File not found:', p)\n"
-                    "else:\n"
-                    "    txt = p.read_text(encoding='utf-8', errors='ignore')\n"
-                    f"    print(txt[:{max_chars}])\n"
-                    "PY"
-                )
-                out = self._send(cmd, 60)
-                return self._ok(name, out, latency=time.time() - start)
-
-            if name == "write_file":
-                path = str(arguments["path"])
-                content = str(arguments["content"])
-                self._ensure_safe_path(path)
-                cmd = (
-                    f"mkdir -p {shlex.quote(str(self._parent_dir(path)))}\n"
-                    f"cat > {shlex.quote(path)} <<'EOF_WRITE'\n"
-                    f"{content}\n"
-                    "EOF_WRITE\n"
-                )
-                out = self._send(cmd, 60)
-                return self._ok(name, out, latency=time.time() - start)
-
-            if name == "apply_patch":
-                patch = str(arguments["patch"])
-                cmd = (
-                    "apply_patch <<'EOF_PATCH'\n"
-                    f"{patch}\n"
-                    "EOF_PATCH\n"
-                )
-                out = self._send(cmd, 120)
-                return self._ok(name, out, latency=time.time() - start)
-
-            if name == "run_tests":
-                test_cmd = str(arguments["test_cmd"])
-                timeout_sec = int(arguments.get("timeout_sec", 600))
-                out = self._send(test_cmd, timeout_sec)
-                return self._ok(name, out, latency=time.time() - start)
-
-            if name == "finish":
-                summary = str(arguments["summary"])
-                return ToolResult(
-                    ok=True,
-                    tool=name,
-                    result="",
-                    latency_sec=time.time() - start,
-                    finished=True,
-                    summary=summary,
-                )
-
-            return ToolResult(
-                ok=False,
-                tool=name,
-                error=f"Unknown tool: {name}",
-                latency_sec=time.time() - start,
-            )
+            return self._dispatch[name](args)
         except Exception as e:
-            return ToolResult(
-                ok=False,
-                tool=name,
-                error=f"{type(e).__name__}: {e}",
-                latency_sec=time.time() - start,
-            )
+            return ToolResult(False, f"{type(e).__name__}: {e}", {"tool": name, "args": args})
 
-    # ---------- helpers ----------
-    def _ok(self, tool: str, output: Any, latency: float) -> ToolResult:
-        text = self._normalize_output(output)
-        text = self._truncate(text)
-        return ToolResult(ok=True, tool=tool, result=text, latency_sec=latency)
+    def _as_text(self, out: Any) -> str:
+        if isinstance(out, str):
+            return out
+        if hasattr(out, "output"):
+            return str(out.output)
+        return json.dumps(out, ensure_ascii=False)
 
-    def _send(self, cmd: str, timeout_sec: int) -> Any:
-        self._log(f"[tool] exec timeout={timeout_sec}s\n{cmd}")
-        try:
-            return self.container.send_command(cmd, timeout_sec)
-        except TypeError:
-            # fallback for containers whose signature is send_command(cmd)
-            return self.container.send_command(cmd)
+    def run_bash(self, args: Dict[str, Any]) -> ToolResult:
+        cmd = args["cmd"]
+        timeout = int(args.get("timeout", self.default_timeout))
 
-    def _normalize_output(self, output: Any) -> str:
-        if output is None:
-            return ""
-        if isinstance(output, str):
-            return output
-        # try common dict keys
-        if isinstance(output, dict):
-            if "stdout" in output or "stderr" in output:
-                stdout = str(output.get("stdout", ""))
-                stderr = str(output.get("stderr", ""))
-                code = output.get("exit_code", output.get("returncode", ""))
-                return f"[exit_code={code}]\n[stdout]\n{stdout}\n[stderr]\n{stderr}"
-            return json.dumps(output, ensure_ascii=False, indent=2)
-        return str(output)
+        blocked = ["rm -rf /", ":(){:|:&};:", "shutdown", "reboot"]
+        if any(x in cmd.lower() for x in blocked):
+            return ToolResult(False, f"Blocked command: {cmd}")
 
-    def _truncate(self, text: str) -> str:
-        if len(text) <= self.max_output_chars:
-            return text
-        return text[: self.max_output_chars] + "\n...[TRUNCATED]..."
+        full = f"cd {shlex.quote(self.workdir)} && {cmd}"
+        out = self.container.send_command(full, timeout)
+        return ToolResult(True, self._as_text(out), {"cmd": full, "timeout": timeout})
 
-    def _ensure_safe_path(self, path: str) -> None:
-        bad_tokens = ["..", "~", "/etc/", "/root/.ssh", "/proc/", "/sys/"]
-        if any(tok in path for tok in bad_tokens):
-            raise ValueError(f"Unsafe path: {path}")
+    def read_file(self, args: Dict[str, Any]) -> ToolResult:
+        path = args["path"]
+        max_bytes = int(args.get("max_bytes", 50000))
+        cmd = (
+            "python - <<'PY'\n"
+            "import os\n"
+            f"p={path!r}\n"
+            f"base={self.workdir!r}\n"
+            "if not os.path.isabs(p): p=os.path.join(base,p)\n"
+            f"b=open(p,'rb').read({max_bytes})\n"
+            "print(b.decode('utf-8', errors='replace'))\n"
+            "PY"
+        )
+        out = self.container.send_command(f"cd {shlex.quote(self.workdir)} && {cmd}", self.default_timeout)
+        return ToolResult(True, self._as_text(out), {"path": path, "max_bytes": max_bytes})
 
-    def _parent_dir(self, path: str) -> str:
-        from pathlib import Path
-        return str(Path(path).parent)
+    def write_file(self, args: Dict[str, Any]) -> ToolResult:
+        path = args["path"]
+        content = args["content"]
+        append = bool(args.get("append", False))
+        mode = "a" if append else "w"
 
-    def _log(self, msg: str) -> None:
-        if self.logger:
-            self.logger(msg)
+        cmd = (
+            "python - <<'PY'\n"
+            "import os\n"
+            f"p={path!r}\n"
+            f"base={self.workdir!r}\n"
+            "if not os.path.isabs(p): p=os.path.join(base,p)\n"
+            "os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+            f"open(p,{mode!r},encoding='utf-8').write({content!r})\n"
+            "print('OK')\n"
+            "PY"
+        )
+        out = self.container.send_command(f"cd {shlex.quote(self.workdir)} && {cmd}", self.default_timeout)
+        return ToolResult(True, self._as_text(out), {"path": path, "append": append})
+
+    def apply_patch(self, args: Dict[str, Any]) -> ToolResult:
+        patch = args["patch"]
+        strip = int(args.get("strip", 0))
+        cmd = (
+            f"cd {shlex.quote(self.workdir)} && "
+            "cat > /tmp/agent.patch <<'PATCH'\n"
+            f"{patch}\n"
+            "PATCH\n"
+            f"(git apply -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
+        )
+        out = self.container.send_command(cmd, self.default_timeout)
+        return ToolResult(True, self._as_text(out), {"strip": strip})
