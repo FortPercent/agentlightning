@@ -173,7 +173,7 @@ class ContainerTools:
             "cat > /tmp/agent.patch <<'PATCH'\n"
             f"{patch}\n"
             "PATCH\n"
-            f"(git apply -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
+            f"(git apply --whitespace=nowarn -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
         )
         out = self.container.send_command(cmd, self.default_timeout)
         return ToolResult(True, self._as_text(out), {"strip": strip})

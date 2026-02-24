@@ -369,7 +369,7 @@ class ClaudeController:
                     "cat > /tmp/agent.patch <<'PATCH'\n"
                     f"{patch}\n"
                     "PATCH\n"
-                    f"(git apply -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
+                    f"(git apply --whitespace=nowarn -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
                 )
                 out = container.send_command(cmd, timeout_default)
                 txt = out if isinstance(out, str) else getattr(out, "output", str(out))

@@ -51,10 +51,15 @@ from swebench.harness.utils import EvaluationError
 import docker
 
 GIT_APPLY_CMDS = [
-    "git apply --verbose",
-    "git apply --verbose --reject",
+    "git apply --verbose --whitespace=nowarn",
+    "git apply --verbose --whitespace=nowarn --reject",
     "patch --batch --fuzz=5 -p1 -i",
 ]
+
+
+def _find_trailing_whitespace_lines(text: str) -> list[int]:
+    """Return 1-based line numbers that end with trailing spaces or tabs."""
+    return [i for i, line in enumerate(text.splitlines(), start=1) if line.endswith((" ", "\t"))]
 
 
 def run_instance(
@@ -131,24 +136,38 @@ def run_instance(
 
         # Copy model prediction as patch file to container
         patch_file = Path(log_dir / "patch.diff")
-        patch_file.write_text(pred[KEY_PREDICTION] or "")
+        patch_text = (pred[KEY_PREDICTION] or "").replace("\r\n", "\n").replace("\r", "\n")
+        trailing_ws_lines = _find_trailing_whitespace_lines(patch_text)
+        if trailing_ws_lines:
+            preview = ", ".join(str(each) for each in trailing_ws_lines[:20])
+            suffix = " ..." if len(trailing_ws_lines) > 20 else ""
+            logger.warning(
+                "Patch contains trailing whitespace on %s lines; first lines: %s%s",
+                len(trailing_ws_lines),
+                preview,
+                suffix,
+            )
+        patch_file.write_text(patch_text)
         logger.info(f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container...")
         copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))  # type: ignore
 
         # Attempt to apply patch to container (TODO: FIX THIS)
         val: Optional[ExecResult] = None
+        applied = False
         for git_apply_cmd in GIT_APPLY_CMDS:
             val = container.exec_run(  # type: ignore
                 f"{git_apply_cmd} {DOCKER_PATCH}",
                 workdir=DOCKER_WORKDIR,
                 user=DOCKER_USER,
             )
+            logger.info(f"Patch apply output ({git_apply_cmd}):\n{val.output.decode(UTF8)}")
             if val.exit_code == 0:
                 logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
+                applied = True
                 break
             else:
                 logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
-        if val is not None:
+        if not applied and val is not None:
             logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
             raise EvaluationError(
                 instance_id,
