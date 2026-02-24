@@ -606,8 +606,22 @@ class ClaudeController:
                 fn_name = tc["function"]["name"]
                 fn_args = tc["function"]["arguments"]
                 tcid = tc["id"]
-                logger.info(f"[tool-loop] Executing {fn_name} args={fn_args}")
+                start_msg = f"[tool-loop] TOOL_START id={tcid} name={fn_name} args={fn_args}"
+                print(start_msg)
+                logger.info(start_msg)
                 result_str = self._exec_container_tool(container, fn_name, fn_args, time_limit=time_limit)
+                try:
+                    parsed = json.loads(result_str)
+                    ok = parsed.get("ok")
+                    content = str(parsed.get("content", ""))
+                    end_msg = (
+                        f"[tool-loop] TOOL_END id={tcid} name={fn_name} ok={ok} "
+                        f"content_preview={content[:200]!r}"
+                    )
+                except Exception:
+                    end_msg = f"[tool-loop] TOOL_END id={tcid} name={fn_name} raw_preview={result_str[:200]!r}"
+                print(end_msg)
+                logger.info(end_msg)
                 self._log.emit(type="tool_result", tool=fn_name, args=fn_args, result=result_str[:2000])
                 return {"tool_call_id": tcid, "name": fn_name, "content": result_str}
 
