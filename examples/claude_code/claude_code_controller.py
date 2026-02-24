@@ -392,6 +392,66 @@ class ClaudeController:
                 return "".join([x.get("text", "") for x in content if x.get("type") == "text"])
             return str(content) if content else ""
 
+        def _tool_args_to_dict(args: Any) -> Dict[str, Any]:
+            if isinstance(args, dict):
+                return args
+            if isinstance(args, str):
+                try:
+                    loaded = json.loads(args)
+                    return loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    return {}
+            return {}
+
+        def _tool_args_to_string(args: Any) -> str:
+            if isinstance(args, str):
+                return args
+            if isinstance(args, dict):
+                return json.dumps(args, ensure_ascii=False)
+            return "{}"
+
+        def _normalize_messages_for_api(src: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            normalized: List[Dict[str, Any]] = []
+            for m in src:
+                role = m.get("role")
+                if role == "assistant" and isinstance(m.get("tool_calls"), list):
+                    tool_calls_out: List[Dict[str, Any]] = []
+                    for tc in m.get("tool_calls", []):
+                        if not isinstance(tc, dict):
+                            continue
+                        fn = tc.get("function") or {}
+                        if not isinstance(fn, dict):
+                            fn = {}
+                        tool_calls_out.append(
+                            {
+                                "id": tc.get("id", "sf"),
+                                "type": "function",
+                                "function": {
+                                    "name": fn.get("name"),
+                                    "arguments": _tool_args_to_string(fn.get("arguments", "{}")),
+                                },
+                            }
+                        )
+                    normalized.append(
+                        {
+                            "role": "assistant",
+                            "content": m.get("content", ""),
+                            "tool_calls": tool_calls_out,
+                        }
+                    )
+                elif role == "tool":
+                    normalized.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": m.get("tool_call_id"),
+                            "name": m.get("name"),
+                            "content": str(m.get("content", "")),
+                        }
+                    )
+                else:
+                    normalized.append(m)
+            return normalized
+
         def _parse_qwen_xml_tool_calls(content: str) -> List[Dict[str, Any]]:
             """Parses Qwen specific XML format for tool calls."""
             tool_calls = []
@@ -417,7 +477,7 @@ class ClaudeController:
                     "type": "function",
                     "function": {
                         "name": func_name,
-                        "arguments": arguments
+                        "arguments": json.dumps(arguments, ensure_ascii=False)
                     }
                 })
             return tool_calls
@@ -431,7 +491,7 @@ class ClaudeController:
         for turn in range(max_turns):
             payload = {
                 "model": model,
-                "messages": messages,
+                "messages": _normalize_messages_for_api(messages),
                 "tools": tools,
                 "tool_choice": "auto",
                 "temperature": 0.0,
@@ -483,29 +543,39 @@ class ClaudeController:
                 break
 
             # Sanitize tool calls
-            sanitized_tool_calls: List[Dict[str, Any]] = []
+            sanitized_tool_calls_for_api: List[Dict[str, Any]] = []
+            sanitized_tool_calls_for_exec: List[Dict[str, Any]] = []
             for tc in tool_calls:
-                fn = tc.get("function", {})
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except:
-                        args = {}
+                tc_dict = tc if isinstance(tc, dict) else {}
+                fn = tc_dict.get("function") or {}
+                if not isinstance(fn, dict):
+                    fn = {}
+                args_raw = fn.get("arguments", "{}")
+                args_for_exec = _tool_args_to_dict(args_raw)
+                args_for_api = _tool_args_to_string(args_raw)
+                tool_call_id = tc_dict.get("id", "sf")
+                fn_name = fn.get("name")
 
-                sanitized_tool_calls.append({
-                    "id": tc.get("id", "sf"),
+                sanitized_tool_calls_for_api.append({
+                    "id": tool_call_id,
                     "type": "function",
                     "function": {
-                        "name": fn.get("name"),
-                        "arguments": args
+                        "name": fn_name,
+                        "arguments": args_for_api
+                    }
+                })
+                sanitized_tool_calls_for_exec.append({
+                    "id": tool_call_id,
+                    "function": {
+                        "name": fn_name,
+                        "arguments": args_for_exec
                     }
                 })
 
             messages.append({
                 "role": "assistant",
                 "content": content_text,
-                "tool_calls": sanitized_tool_calls
+                "tool_calls": sanitized_tool_calls_for_api
             })
 
             # Execute tools — run in parallel when multiple tool calls are returned.
@@ -518,12 +588,12 @@ class ClaudeController:
                 self._log.emit(type="tool_result", tool=fn_name, args=fn_args, result=result_str[:2000])
                 return {"tool_call_id": tcid, "name": fn_name, "content": result_str}
 
-            if len(sanitized_tool_calls) == 1:
-                tool_results = [_exec_one(sanitized_tool_calls[0])]
+            if len(sanitized_tool_calls_for_exec) == 1:
+                tool_results = [_exec_one(sanitized_tool_calls_for_exec[0])]
             else:
-                with ThreadPoolExecutor(max_workers=len(sanitized_tool_calls)) as _pool:
+                with ThreadPoolExecutor(max_workers=len(sanitized_tool_calls_for_exec)) as _pool:
                     # Preserve original order so tool_call_id pairing stays correct.
-                    tool_results = list(_pool.map(_exec_one, sanitized_tool_calls))
+                    tool_results = list(_pool.map(_exec_one, sanitized_tool_calls_for_exec))
 
             for tr in tool_results:
                 messages.append({"role": "tool", **tr})
