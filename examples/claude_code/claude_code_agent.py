@@ -334,6 +334,7 @@ async def dry_run_claude_code(
     api_base_url: Optional[str],
     output_dir: Optional[str],
     max_turns: int,
+    run_method: Literal["python", "cli", "openai_tools", "multistep"],
     limit: Optional[int],
     cooldown_seconds: float,
 ) -> None:
@@ -439,7 +440,11 @@ async def dry_run_claude_code(
         )
 
         # Initialize Claude Code Agent
-        claude_code_agent = ClaudeCodeAgent(swebench_full_dataset=swebench_full_dataset, max_turns=max_turns)
+        claude_code_agent = ClaudeCodeAgent(
+            swebench_full_dataset=swebench_full_dataset,
+            max_turns=max_turns,
+            run_method=run_method,
+        )
 
         # Execution Loop
         for instance in dataset:
@@ -505,6 +510,13 @@ if __name__ == "__main__":
     # Execution Configuration
     parser.add_argument("--dataset-path", type=str, default="swebench_samples.jsonl", help="Path to the dataset.")
     parser.add_argument("--max-turns", type=int, default=5, help="Maximum turns per instance.")
+    parser.add_argument(
+        "--run-method",
+        type=str,
+        default="openai_tools",
+        choices=["python", "cli", "openai_tools", "multistep"],
+        help="Execution method inside ClaudeController.",
+    )
     parser.add_argument("--output-dir", type=str, default="data", help="Directory to save output logs.")
     parser.add_argument("--limit", type=int, default=None, help="Limit the number of instances to run (for debugging).")
     parser.add_argument("--cooldown-seconds", type=float, default=2.0, help="Cooldown seconds between instances.")
@@ -553,6 +565,7 @@ if __name__ == "__main__":
             api_base_url=args.base_url if backend_mode == "vllm" else None,
             output_dir=args.output_dir,
             max_turns=args.max_turns,
+            run_method=cast(Literal["python", "cli", "openai_tools", "multistep"], args.run_method),
             limit=args.limit,
             cooldown_seconds=args.cooldown_seconds,
         )
