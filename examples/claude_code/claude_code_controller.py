@@ -7,9 +7,13 @@ within Docker containers. It handles container initialization, command execution
 patch application for SWE-bench evaluation tasks.
 """
 
+import datetime
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from functools import partial
-from typing import Literal, TypedDict
+from typing import IO, Literal, Optional, TypedDict
 
 import dotenv
 from swebench.harness.constants import SWEbenchInstance
@@ -17,11 +21,39 @@ from swebench_utils.docker_runtime import Runtime
 from swebench_utils.logging import log_for_evaluation
 import json
 import requests
-import time 
+import time
 import shlex
 
 SWEBENCH_EXTRA_SYSTEM_PROMPT = """
- You are an expert software engineer solving swebench bug fixing tasks.
+You are an expert software engineer solving swebench bug fixing tasks.
+
+Tool calling guidelines:
+- When multiple operations are INDEPENDENT (e.g., reading several unrelated files, running multiple unrelated checks), call those tools IN PARALLEL by including multiple tool calls in a single response.
+- Only call tools sequentially when the output of one is needed as input to the next.
+- Prefer parallel tool calls wherever possible to save time.
+"""
+
+PLANNING_SYSTEM_PROMPT = """You are a planning agent for software bug-fixing tasks.
+Given a bug description, output a JSON execution plan that lists the steps needed to fix it.
+
+Rules:
+- Output ONLY valid JSON, no explanation text before or after.
+- Each step must have: "name" (unique slug), "instruction" (detailed task), "max_turns" (int).
+- Steps are executed sequentially; later steps receive summaries of earlier ones.
+- Typical steps: reproduce, locate, fix, validate. Add or remove steps as needed.
+- Complex bugs may need extra steps (e.g., "profile", "trace", "bisect").
+- Simple bugs may only need 3 steps.
+- max_turns for each step should be proportional to its complexity (range: 3–20).
+
+Output format:
+{
+  "steps": [
+    {"name": "reproduce", "instruction": "...", "max_turns": 8},
+    {"name": "locate",    "instruction": "...", "max_turns": 8},
+    {"name": "fix",       "instruction": "...", "max_turns": 10},
+    {"name": "validate",  "instruction": "...", "max_turns": 5}
+  ]
+}
 """
 
 SWEBENCH_USER_PROMPT = """
@@ -39,6 +71,55 @@ Please do not commit your edits. We will do it later.
 """
 
 logger = logging.getLogger("claude_code_agent")
+
+import json
+import re
+import requests
+from typing import Literal, TypedDict, Any, Dict, List, Optional, cast
+
+
+class StreamLogger:
+    """Writes structured JSONL event records to a file, one JSON object per line.
+
+    Each `emit()` call appends one record with a UTC timestamp and any extra
+    keyword arguments supplied by the caller.  Pass ``path=None`` to create a
+    no-op logger that discards all events (useful when streaming is disabled).
+    """
+
+    def __init__(self, path: Optional[str]) -> None:
+        self._file: Optional[IO[str]] = open(path, "a", encoding="utf-8") if path else None
+        self._lock = threading.Lock()
+
+    def emit(self, **kwargs: Any) -> None:
+        if self._file is None:
+            return
+        kwargs.setdefault("time", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
+        with self._lock:
+            self._file.write(json.dumps(kwargs, ensure_ascii=False) + "\n")
+            self._file.flush()
+
+    def close(self) -> None:
+        if self._file:
+            self._file.close()
+            self._file = None
+
+
+def _default_list() -> List[str]:
+    return []
+
+
+@dataclass
+class SubAgent:
+    """Represents a sub-task in the multi-step pipeline.
+
+    Each SubAgent has its own independent container and tool loop.
+    """
+
+    name: str
+    instruction: str
+    max_turns: int
+    result: str = ""
+    depends_on: List[str] = field(default_factory=_default_list)
 
 
 class RunInstanceResult(TypedDict):
@@ -74,6 +155,7 @@ class ClaudeController:
         self.endpoint = endpoint
         self.api_key = api_key
         self.container: Runtime = self.init_container(self.image, self.instance)
+        self._log: StreamLogger = StreamLogger(None)  # replaced by run_instance when stream_path is set
 
     def init_container(self, image: str, instance: SWEbenchInstance) -> Runtime:
         """Initializes the Docker container and sets up the Claude Code environment.
@@ -136,6 +218,622 @@ class ClaudeController:
         self.container.send_command(claude_cmd, time_limit * 60)
         logger.info(f"Claude Code CLI command completed")
     
+    def _build_tools_schema(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_bash",
+                    "description": "Run shell command in sandbox container",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                            "timeout": {"type": "integer"},
+                        },
+                        "required": ["cmd"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read UTF-8 text file content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "max_bytes": {"type": "integer"},
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write UTF-8 text file content",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "append": {"type": "boolean"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "apply_patch",
+                    "description": "Apply unified diff patch in /testbed",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "patch": {"type": "string"},
+                            "strip": {"type": "integer"},
+                        },
+                        "required": ["patch"],
+                    },
+                },
+            },
+        ]
+
+    def _exec_container_tool(self, container: Runtime, name: str, args: Dict[str, Any], time_limit: int) -> str:
+        """Execute one tool in container and return JSON string."""
+        def _ok(content: str, **meta: Any) -> str:
+            return json.dumps({"ok": True, "content": content, "metadata": meta}, ensure_ascii=False)
+
+        def _err(content: str, **meta: Any) -> str:
+            return json.dumps({"ok": False, "content": content, "metadata": meta}, ensure_ascii=False)
+
+        try:
+            timeout_default = min(120, time_limit * 60)
+
+            if name == "run_bash":
+                cmd = args["cmd"]
+                timeout = int(args.get("timeout", timeout_default))
+                blocked = ["rm -rf /", ":(){:|:&};:", "shutdown", "reboot"]
+                if any(x in cmd.lower() for x in blocked):
+                    return _err(f"Blocked command: {cmd}", tool=name)
+                full = f"cd /testbed && {cmd}"
+                out = container.send_command(full, timeout)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, cmd=full, timeout=timeout)
+
+            if name == "read_file":
+                path = args["path"]
+                max_bytes = int(args.get("max_bytes", 60000))
+                py = (
+                    "import os\n"
+                    f"p={path!r}\n"
+                    "if not os.path.isabs(p): p=os.path.join('/testbed', p)\n"
+                    f"b=open(p,'rb').read({max_bytes})\n"
+                    "print(b.decode('utf-8', errors='replace'))\n"
+                )
+                cmd = f"cd /testbed && python - <<'PY'\n{py}PY"
+                out = container.send_command(cmd, timeout_default)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, path=path, max_bytes=max_bytes)
+
+            if name == "write_file":
+                path = args["path"]
+                content = args["content"]
+                append = bool(args.get("append", False))
+                mode = "a" if append else "w"
+                py = (
+                    "import os\n"
+                    f"p={path!r}\n"
+                    "if not os.path.isabs(p): p=os.path.join('/testbed', p)\n"
+                    "os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+                    f"open(p,{mode!r},encoding='utf-8').write({content!r})\n"
+                    "print('OK')\n"
+                )
+                cmd = f"cd /testbed && python - <<'PY'\n{py}PY"
+                out = container.send_command(cmd, timeout_default)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, path=path, append=append)
+
+            if name == "apply_patch":
+                patch = args["patch"]
+                strip = int(args.get("strip", 0))
+                cmd = (
+                    "cd /testbed && "
+                    "cat > /tmp/agent.patch <<'PATCH'\n"
+                    f"{patch}\n"
+                    "PATCH\n"
+                    f"(git apply -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
+                )
+                out = container.send_command(cmd, timeout_default)
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                return _ok(txt, tool=name, strip=strip)
+
+            return _err(f"Unknown tool: {name}", tool=name, args=args)
+
+        except Exception as e:
+            return _err(f"{type(e).__name__}: {e}", tool=name, args=args)
+
+    def _tool_loop(
+        self,
+        container: Runtime,
+        messages: List[Dict[str, Any]],
+        max_turns: int,
+        time_limit: int,
+        model: str = "claude-sonnet-4-5-20250929",
+    ) -> str:
+        """Generic multi-turn tool loop that executes in the specified container.
+
+        Args:
+            container: The Docker runtime container to execute tools in.
+            messages: Initial conversation history.
+            max_turns: Maximum number of LLM interaction turns.
+            time_limit: Time limit for tool execution in minutes.
+            model: The model name to use for LLM calls.
+
+        Returns:
+            The final text response from the LLM.
+        """
+        url = f"{self.endpoint}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if getattr(self, "api_key", None):
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        tools = self._build_tools_schema()
+        final_text = ""
+
+        def _extract_content_text(content: Any) -> str:
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "".join([x.get("text", "") for x in content if x.get("type") == "text"])
+            return str(content) if content else ""
+
+        def _parse_qwen_xml_tool_calls(content: str) -> List[Dict[str, Any]]:
+            """Parses Qwen specific XML format for tool calls."""
+            tool_calls = []
+            tool_call_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+            func_name_pattern = re.compile(r"<function=(.*?)>", re.DOTALL)
+            param_pattern = re.compile(r"<parameter=(.*?)>(.*?)</parameter>", re.DOTALL)
+
+            for match in tool_call_pattern.finditer(content):
+                block = match.group(1)
+                fn_match = func_name_pattern.search(block)
+                if not fn_match:
+                    continue
+                func_name = fn_match.group(1).strip()
+
+                arguments = {}
+                for p_match in param_pattern.finditer(block):
+                    key = p_match.group(1).strip()
+                    val = p_match.group(2)
+                    arguments[key] = val
+
+                tool_calls.append({
+                    "id": f"call_{len(tool_calls)}_{func_name}",
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "arguments": arguments
+                    }
+                })
+            return tool_calls
+
+        # Pre-flight check
+        try:
+            container.send_command("cd /testbed && git config --global --add safe.directory /testbed", timeout=10)
+        except Exception:
+            pass
+
+        for turn in range(max_turns):
+            payload = {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "temperature": 0.0,
+                "max_tokens": 4096,
+                "stop": ["<|im_end|>", "<|endoftext|>"]
+            }
+
+            logger.info(f"[tool-loop] turn={turn+1} invoking model...")
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=time_limit * 60)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.error(f"API Request failed: {e}")
+                break
+
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            content_raw = msg.get("content", "")
+            content_text = _extract_content_text(content_raw)
+
+            # Try native parsing first, fallback to XML
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls and "<tool_call>" in content_text:
+                tool_calls = _parse_qwen_xml_tool_calls(content_text)
+
+            logger.info(f"[tool-loop] turn={turn+1} content_len={len(content_text)} tool_calls={len(tool_calls)}")
+
+            # Emit structured log event
+            usage: Dict[str, Any] = data.get("usage") or {}
+            tc_summary: List[Dict[str, Any]] = []
+            for tc in tool_calls:
+                tc_dict = cast(Dict[str, Any], tc)
+                fn_info: Dict[str, Any] = cast(Dict[str, Any], tc_dict.get("function") or {})
+                tc_summary.append({"name": fn_info.get("name"), "args": fn_info.get("arguments")})
+            self._log.emit(
+                type="llm_response",
+                turn=turn + 1,
+                content=content_text[:2000],
+                tool_calls=tc_summary,
+                finish_reason=choice.get("finish_reason"),
+                usage=usage,
+            )
+
+            # No tool calls -> final answer
+            if not tool_calls:
+                final_text = content_text
+                messages.append({"role": "assistant", "content": final_text})
+                break
+
+            # Sanitize tool calls
+            sanitized_tool_calls: List[Dict[str, Any]] = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        args = {}
+
+                sanitized_tool_calls.append({
+                    "id": tc.get("id", "sf"),
+                    "type": "function",
+                    "function": {
+                        "name": fn.get("name"),
+                        "arguments": args
+                    }
+                })
+
+            messages.append({
+                "role": "assistant",
+                "content": content_text,
+                "tool_calls": sanitized_tool_calls
+            })
+
+            # Execute tools — run in parallel when multiple tool calls are returned.
+            def _exec_one(tc: Dict[str, Any]) -> Dict[str, Any]:
+                fn_name = tc["function"]["name"]
+                fn_args = tc["function"]["arguments"]
+                tcid = tc["id"]
+                logger.info(f"[tool-loop] Executing {fn_name} args={fn_args}")
+                result_str = self._exec_container_tool(container, fn_name, fn_args, time_limit=time_limit)
+                self._log.emit(type="tool_result", tool=fn_name, args=fn_args, result=result_str[:2000])
+                return {"tool_call_id": tcid, "name": fn_name, "content": result_str}
+
+            if len(sanitized_tool_calls) == 1:
+                tool_results = [_exec_one(sanitized_tool_calls[0])]
+            else:
+                with ThreadPoolExecutor(max_workers=len(sanitized_tool_calls)) as _pool:
+                    # Preserve original order so tool_call_id pairing stays correct.
+                    tool_results = list(_pool.map(_exec_one, sanitized_tool_calls))
+
+            for tr in tool_results:
+                messages.append({"role": "tool", **tr})
+
+        return final_text
+
+    def _run_sub_agent(
+        self,
+        sub: SubAgent,
+        container: Runtime,
+        context: str,
+        time_limit: int,
+    ) -> SubAgent:
+        """Execute a single sub-agent using the provided container.
+
+        The caller is responsible for the container's lifecycle (creation and cleanup).
+        For sequential pipelines pass `self.container`; for parallel execution pass
+        a dedicated container per sub-agent.
+
+        Args:
+            sub: The SubAgent configuration.
+            container: The Docker runtime in which tools will execute.
+            context: Summary of results from previous steps.
+            time_limit: Time limit for tool execution in minutes.
+
+        Returns:
+            The SubAgent with the `result` field filled in.
+        """
+        logger.info(f"[sub-agent] Starting sub-agent: {sub.name}")
+        self._log.emit(type="step_start", step=sub.name, instruction=sub.instruction, max_turns=sub.max_turns)
+
+        system_prompt = (
+            SWEBENCH_EXTRA_SYSTEM_PROMPT
+            + "\n\nYou are working on a specific step of a multi-step task."
+            + "\nFocus only on your assigned task."
+        )
+
+        user_prompt = ""
+        if context:
+            user_prompt += f"Context from previous steps:\n{context}\n\n"
+        user_prompt += f"Your current task:\n{sub.instruction}"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        sub.result = self._tool_loop(container, messages, sub.max_turns, time_limit)
+
+        logger.info(f"[sub-agent] Completed sub-agent: {sub.name}")
+        self._log.emit(type="step_end", step=sub.name, result=sub.result[:1000])
+
+        return sub
+
+    def _run_sub_agents_parallel(
+        self,
+        subs: List[SubAgent],
+        instance: SWEbenchInstance,
+        context: str,
+        time_limit: int,
+        max_workers: int = 4,
+    ) -> List[SubAgent]:
+        """Execute multiple sub-agents in parallel, each with its own container.
+
+        Args:
+            subs: List of SubAgent configurations to execute.
+            instance: The SWE-bench instance.
+            context: Shared context for all sub-agents.
+            time_limit: Time limit for each sub-agent in minutes.
+            max_workers: Maximum number of parallel workers.
+
+        Returns:
+            List of completed SubAgents with results.
+        """
+        logger.info(f"[parallel] Starting {len(subs)} sub-agents in parallel")
+
+        # Each parallel sub-agent gets its own container for isolation.
+        containers: List[Runtime] = [self.init_container(self.image, instance) for _ in subs]  # type: ignore[no-untyped-call]
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(self._run_sub_agent, sub, container, context, time_limit): sub
+                    for sub, container in zip(subs, containers)
+                }
+
+                results: List[SubAgent] = []
+                for future in as_completed(futures):
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        sub = futures[future]
+                        logger.error(f"[parallel] Sub-agent {sub.name} failed: {e}")
+                        sub.result = f"ERROR: {e}"
+                        results.append(sub)
+        finally:
+            for container in containers:
+                container.cleanup()
+
+        logger.info(f"[parallel] Completed {len(results)} sub-agents")
+        return results
+
+    def _get_default_plan(self, instance: SWEbenchInstance, max_turns: int) -> List[SubAgent]:
+        """Return the hardcoded 4-step plan as a fallback.
+
+        Args:
+            instance: The SWE-bench instance.
+            max_turns: Total turns to distribute evenly across steps.
+
+        Returns:
+            List of SubAgent objects for the default pipeline.
+        """
+        per_step = max(3, max_turns // 4)
+        return [
+            SubAgent(
+                name="reproduce",
+                instruction=(
+                    "Step 1: Write test cases to reproduce the bug.\n"
+                    f"Bug description:\n{instance['problem_statement']}\n\n"
+                    "Tasks:\n"
+                    "- Create a test file at /testbed/test_repro.py\n"
+                    "- Run the test to confirm the bug exists\n"
+                    "- Output the test failure"
+                ),
+                max_turns=per_step,
+            ),
+            SubAgent(
+                name="locate",
+                instruction=(
+                    "Step 2: Explore the source code to find the root cause of the bug.\n\n"
+                    "Tasks:\n"
+                    "- Read relevant source files\n"
+                    "- Identify the exact file(s) and line(s) that need to be changed\n"
+                    "- Explain the root cause"
+                ),
+                max_turns=per_step,
+            ),
+            SubAgent(
+                name="fix",
+                instruction=(
+                    "Step 3: Edit the source code to fix the bug.\n\n"
+                    "Tasks:\n"
+                    "- Apply minimal, targeted changes to fix the bug\n"
+                    "- Do NOT modify test files\n"
+                    "- Ensure the fix addresses the root cause identified earlier"
+                ),
+                max_turns=per_step,
+            ),
+            SubAgent(
+                name="validate",
+                instruction=(
+                    "Step 4: Validate the fix by running tests.\n\n"
+                    "Tasks:\n"
+                    "- Run the reproduction test from step 1\n"
+                    "- Confirm the test now passes\n"
+                    "- Delete /testbed/test_repro.py after validation\n"
+                    "- Summarize the fix"
+                ),
+                max_turns=per_step,
+            ),
+        ]
+
+    def _generate_plan(
+        self,
+        instance: SWEbenchInstance,
+        max_turns: int,
+        time_limit: int,
+        model: str = "claude-sonnet-4-5-20250929",
+    ) -> List[SubAgent]:
+        """Ask the LLM to generate a dynamic execution plan for this bug.
+
+        Calls the LLM once (no tools) with the bug description and expects a
+        JSON response containing a list of steps. Falls back to the default
+        4-step plan on any error.
+
+        Args:
+            instance: The SWE-bench instance.
+            max_turns: Budget hint passed to the planner so it can distribute turns.
+            time_limit: Per-request timeout in minutes.
+            model: Model to use for the planning call.
+
+        Returns:
+            List of SubAgent objects derived from the LLM's plan.
+        """
+        url = f"{self.endpoint}/chat/completions"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+
+        planning_user_prompt = (
+            f"Bug description:\n{instance['problem_statement']}\n\n"
+            f"Total turn budget: {max_turns}.\n"
+            "Generate a focused execution plan. Output ONLY the JSON object."
+        )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
+                {"role": "user", "content": planning_user_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 1024,
+        }
+
+        logger.info("[planner] Requesting dynamic plan from LLM...")
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=time_limit * 60)
+            resp.raise_for_status()
+            data = resp.json()
+
+            choices: List[Any] = data.get("choices") or [{}]
+            raw_content: str = str(choices[0].get("message", {}).get("content", "") or "")
+            logger.info(f"[planner] Raw plan response: {raw_content[:500]}")
+
+            # Strip markdown code fences if present
+            cleaned: str = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content.strip(), flags=re.MULTILINE).strip()
+            plan_data: Dict[str, Any] = json.loads(cleaned)
+            steps_raw: List[Dict[str, Any]] = plan_data.get("steps", [])
+
+            if not steps_raw:
+                raise ValueError("Plan contained no steps")
+
+            sub_agents: List[SubAgent] = []
+            for step in steps_raw:
+                step_name: str = str(step.get("name", f"step_{len(sub_agents)}")).strip()
+                instruction: str = str(step.get("instruction", "")).strip()
+                mt: int = int(step.get("max_turns", max(3, max_turns // len(steps_raw))))
+                if not instruction:
+                    logger.warning(f"[planner] Step '{step_name}' has empty instruction, skipping")
+                    continue
+                sub_agents.append(SubAgent(name=step_name, instruction=instruction, max_turns=mt))
+
+            logger.info(f"[planner] Generated plan with {len(sub_agents)} steps: {[s.name for s in sub_agents]}")
+            return sub_agents
+
+        except Exception as e:
+            logger.warning(f"[planner] Plan generation failed ({e}), falling back to default plan")
+            return self._get_default_plan(instance, max_turns)
+
+    def _run_multistep(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> str:
+        """Multi-step pipeline execution with independent sub-agents.
+
+        Args:
+            instance: The SWE-bench instance.
+            max_turns: Total turns to distribute across steps.
+            time_limit: Time limit for each step in minutes.
+
+        Returns:
+            Summary of the final step.
+        """
+        logger.info("[multi-step] Starting multi-step pipeline")
+        t0 = time.monotonic()
+        instance_id: str = str(instance.get("instance_id", "unknown"))  # type: ignore[attr-defined]
+        self._log.emit(type="start", instance_id=instance_id, max_turns=max_turns, time_limit=time_limit)
+
+        # Let the LLM generate an execution plan for this bug
+        steps = self._generate_plan(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
+        self._log.emit(type="plan", steps=[{"name": s.name, "max_turns": s.max_turns} for s in steps])
+
+        # Execute steps sequentially
+        step_summaries: List[str] = []
+        completed: Dict[str, SubAgent] = {}
+
+        # All steps share self.container — changes accumulate naturally,
+        # just like a human engineer working in one terminal throughout.
+        for step in steps:
+            context = "\n".join(step_summaries)
+            logger.info(f"[multi-step] Starting step: {step.name}")
+            step = self._run_sub_agent(step, self.container, context, time_limit)
+            completed[step.name] = step
+            step_summaries.append(f"[{step.name}]: {step.result[:500]}")
+            logger.info(f"[multi-step] Completed step: {step.name}")
+
+        elapsed = round(time.monotonic() - t0, 1)
+        logger.info("[multi-step] Multi-step pipeline completed")
+        self._log.emit(
+            type="end",
+            instance_id=instance_id,
+            n_steps=len(completed),
+            steps_completed=list(completed.keys()),
+            elapsed_seconds=elapsed,
+        )
+        return step_summaries[-1] if step_summaries else ""
+
+    def _run_openai_tools(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> str:
+        """Multi-turn tool loop tailored for Qwen XML-style tool calling.
+
+        This method constructs the initial messages and delegates to _tool_loop.
+        """
+        prompt_text = SWEBENCH_USER_PROMPT.format(
+            description=instance["problem_statement"].replace('"""', "'''")
+        )
+
+        system_prompt = (
+            SWEBENCH_EXTRA_SYSTEM_PROMPT
+            + "\n\nYou are a code-fixing agent with tools in sandbox."
+            + "\nRules:"
+            + "\n1) If info is missing, call tools first."
+            + "\n2) Do NOT provide only high-level suggestions."
+            + "\n3) For code changes, use apply_patch/write_file with exact content."
+            + "\n4) Before final answer, run validation commands via tools."
+            + "\n5) Final answer must include changed files and exact patch summary."
+        )
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt_text},
+        ]
+
+        return self._tool_loop(self.container, messages, max_turns, time_limit)
+
+
     # _run_openai
     def _run_openai(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> None:
         """
@@ -272,18 +970,21 @@ fi
         instance: SWEbenchInstance,
         max_turns: int = 40,
         time_limit: int = 30,
-        run_method: Literal["python", "cli"] = "python",
+        run_method: Literal["python", "cli", "openai_tools", "multistep"] = "openai_tools",
+        stream_path: Optional[str] = None,
     ) -> RunInstanceResult:
         """Runs the agent on a specific SWE-bench instance.
 
-        This method orchestrates the agent execution via the specified method (CLI or Python),
-        and extracts the generated git diff (patch) upon completion.
+        This method orchestrates the agent execution via the specified method.
 
         Args:
             instance: The dataset instance dictionary.
             max_turns: Maximum conversation turns allowed for the agent. Defaults to 40.
             time_limit: Time limit for the execution in minutes. Defaults to 30.
-            run_method: The execution method, either "python" (SDK) or "cli". Defaults to "python".
+            run_method: The execution method. Options: "python", "cli", "openai_tools", "multistep".
+            stream_path: Optional path to a JSONL file for structured event logging. Each line
+                is a JSON object with a `type` field (e.g. `start`, `plan`, `step_start`,
+                `llm_response`, `tool_result`, `step_end`, `end`). Pass `None` to disable.
 
         Returns:
             A dictionary containing the result:
@@ -293,16 +994,22 @@ fi
             - model_name_or_path: Hardcoded to "cc" (Claude Code).
 
         Raises:
-            ValueError: If `run_method` is not "python" or "cli".
+            ValueError: If `run_method` is not one of the supported methods.
         """
-        if run_method == "python":
-            logger.warning("Running Claude Code using Python SDK is still under development and not yet stable.")
-            self._run_python_sdk(instance, max_turns, time_limit)
-        elif run_method == "cli":
-            # self._run_cli(instance, max_turns, time_limit)
-            self._run_openai(instance, max_turns, time_limit)
-        else:
-            raise ValueError(f"Wrong run_method '{run_method}', run_method should be in ['python', 'cli']")
+        self._log = StreamLogger(stream_path)
+        print(f"===run_method: {run_method}=====")
+        try:
+            if run_method == "python":
+                logger.warning("Running Claude Code using Python SDK is still under development and not yet stable.")
+                self._run_python_sdk(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
+            elif run_method == "cli":
+                self._run_openai(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
+            elif run_method == "openai_tools":
+                self._run_openai_tools(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
+            else:
+                self._run_multistep(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
+        finally:
+            self._log.close()
 
         result = self.container.send_command("git --no-pager diff HEAD")
         logger.info(f"====== Result: {result} ==========")

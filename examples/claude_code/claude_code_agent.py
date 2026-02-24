@@ -129,7 +129,7 @@ class ClaudeCodeAgent(LitAgent[SWEbenchInstance]):
         self,
         namespace: Literal["swebench", "starryzhang"] = "swebench",
         max_turns: int = 5,
-        run_method: Literal["python", "cli"] = "cli",
+        run_method: Literal["python", "cli", "openai_tools", "multistep"] = "openai_tools",
         open_file_limit: int = 4096,
         cache_level: str = "env",  # ["none", "base", "env", "instance"]
         clean: bool = False,
@@ -182,7 +182,7 @@ class ClaudeCodeAgent(LitAgent[SWEbenchInstance]):
             )
             # 2. execute task
             prediction = controller.run_instance(
-                task, max_turns=self.max_turns, run_method=cast(Literal["python", "cli"], self.run_method)
+                task, max_turns=self.max_turns, run_method=cast(Literal["python", "cli", "openai_tools", "multistep"], self.run_method)
             )
             del controller
         except Exception as e:
