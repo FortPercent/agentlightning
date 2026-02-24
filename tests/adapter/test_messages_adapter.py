@@ -391,3 +391,133 @@ def test_trace_messages_adapter_handles_multiple_tool_calls():
     ]
 
     assert adapter.adapt(spans) == expected
+
+
+@pytest.mark.skipif(
+    _skip_for_openai_lt_1_100_0,
+    reason="Requires openai>=1.100.0",
+)
+def test_trace_messages_adapter_parses_blob_messages_with_tool_results():
+    tool_name = "run_bash"
+    tool_call_id = "chatcmpl-tool-1"
+    tool_arguments = "{\"cmd\":\"pwd\"}"
+    tool_parameters = json.dumps(
+        {
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"],
+        }
+    )
+    tool_output = "{\"ok\":true,\"content\":\"/testbed\"}"
+
+    spans = [
+        make_span(
+            "litellm_request",
+            {
+                "gen_ai.input.messages": json.dumps(
+                    [
+                        {"role": "system", "parts": [{"type": "text", "content": "You are a coding assistant."}]},
+                        {"role": "user", "parts": [{"type": "text", "content": "Run pwd"}]},
+                    ]
+                ),
+                "gen_ai.output.messages": json.dumps(
+                    [
+                        {
+                            "role": "assistant",
+                            "parts": [{"type": "text", "content": "Calling tool."}],
+                            "tool_calls": [
+                                {
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": tool_arguments},
+                                }
+                            ],
+                        }
+                    ]
+                ),
+                "llm.request.functions.0.name": tool_name,
+                "llm.request.functions.0.description": "Run shell command in sandbox container",
+                "llm.request.functions.0.parameters": tool_parameters,
+            },
+            1,
+        ),
+        make_span(
+            "litellm_request",
+            {
+                "gen_ai.input.messages": json.dumps(
+                    [
+                        {"role": "system", "parts": [{"type": "text", "content": "You are a coding assistant."}]},
+                        {"role": "user", "parts": [{"type": "text", "content": "Run pwd"}]},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": tool_arguments},
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "parts": [{"type": "text", "content": tool_output}],
+                        },
+                    ]
+                ),
+                "gen_ai.output.messages": json.dumps(
+                    [{"role": "assistant", "parts": [{"type": "text", "content": "Done."}]}]
+                ),
+            },
+            2,
+        ),
+    ]
+
+    adapter = TraceToMessages()
+    result = adapter.adapt(spans)
+
+    assert len(result) == 2
+    assert result[0]["messages"] == [
+        {"role": "system", "content": "You are a coding assistant."},
+        {"role": "user", "content": "Run pwd"},
+        {
+            "role": "assistant",
+            "content": "Calling tool.",
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": tool_arguments},
+                }
+            ],
+        },
+    ]
+    assert result[0]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "Run shell command in sandbox container",
+                "parameters": json.loads(tool_parameters),
+            },
+        }
+    ]
+
+    assert result[1]["messages"] == [
+        {"role": "system", "content": "You are a coding assistant."},
+        {"role": "user", "content": "Run pwd"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": tool_arguments},
+                }
+            ],
+        },
+        {"role": "tool", "content": tool_output, "tool_call_id": tool_call_id},
+        {"role": "assistant", "content": "Done."},
+    ]
+    assert result[1]["tools"] is None

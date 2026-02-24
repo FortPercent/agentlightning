@@ -50,6 +50,118 @@ class _RawSpanInfo(TypedDict):
     tools: List[Dict[str, Any]]
 
 
+def _json_loads_maybe(value: Any) -> Any:
+    """Best-effort JSON parsing helper.
+
+    Returns the original object for non-string values and `None` for invalid JSON strings.
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value
+
+
+def _extract_text_from_parts(parts: Any) -> Optional[str]:
+    """Extract concatenated text content from OpenAI-style `parts` blocks."""
+    if not isinstance(parts, list):
+        return None
+    chunks: List[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        # LiteLLM can emit text blocks as {"type":"text","content":"..."} or {"text":"..."}.
+        candidate = part.get("content")
+        if not isinstance(candidate, str):
+            candidate = part.get("text")
+        if isinstance(candidate, str):
+            chunks.append(candidate)
+    if not chunks:
+        return None
+    return "".join(chunks)
+
+
+def _extract_message_content(message: Dict[str, Any]) -> Optional[str]:
+    """Extract a text content string from heterogeneous message payloads."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        maybe_text = content.get("text")
+        if isinstance(maybe_text, str):
+            return maybe_text
+    if isinstance(content, list):
+        extracted = _extract_text_from_parts(content)
+        if extracted is not None:
+            return extracted
+    return _extract_text_from_parts(message.get("parts"))
+
+
+def _normalize_tool_calls(raw_tool_calls: Any) -> List[Dict[str, str]]:
+    """Normalize tool calls to `{id,name,arguments}` with stringified arguments."""
+    if not isinstance(raw_tool_calls, list):
+        return []
+    normalized: List[Dict[str, str]] = []
+    for idx, call in enumerate(raw_tool_calls):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name_raw = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name_raw, str) or not name_raw:
+            continue
+        arguments = function.get("arguments", "{}")
+        if isinstance(arguments, (dict, list)):
+            arguments_str = json.dumps(arguments, ensure_ascii=False)
+        elif arguments is None:
+            arguments_str = "{}"
+        else:
+            arguments_str = str(arguments)
+        call_id_raw = call.get("id")
+        call_id = str(call_id_raw) if call_id_raw is not None else f"call_{idx}"
+        normalized.append({"id": call_id, "name": name_raw, "arguments": arguments_str})
+    return normalized
+
+
+def _normalize_message_dict(raw_message: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a message object from `gen_ai.{input,output}.messages` payloads."""
+    if not isinstance(raw_message, dict):
+        return None
+    role = raw_message.get("role")
+    if not isinstance(role, str):
+        return None
+
+    message: Dict[str, Any] = {"role": role}
+    content = _extract_message_content(raw_message)
+    tool_calls = _normalize_tool_calls(raw_message.get("tool_calls"))
+
+    if role == "assistant" and tool_calls:
+        message["tool_calls"] = tool_calls
+        message["content"] = content
+    else:
+        message["content"] = content if content is not None else ""
+
+    if role == "tool":
+        tool_call_id = raw_message.get("tool_call_id")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            message["tool_call_id"] = tool_call_id
+
+    return message
+
+
+def _messages_from_blob(raw_blob: Any) -> List[Dict[str, Any]]:
+    """Parse and normalize message arrays from JSON string blobs."""
+    parsed = _json_loads_maybe(raw_blob)
+    if not isinstance(parsed, list):
+        return []
+    messages: List[Dict[str, Any]] = []
+    for item in parsed:
+        normalized = _normalize_message_dict(item)
+        if normalized is not None:
+            messages.append(normalized)
+    return messages
+
+
 def group_genai_dict(data: Dict[str, Any], prefix: str) -> Union[Dict[str, Any], List[Any]]:
     """Convert flattened trace attributes into nested structures.
 
@@ -126,6 +238,26 @@ def convert_to_openai_messages(prompt_completion_list: List[_RawSpanInfo]) -> Ge
         ChatCompletionMessageParam,
     )
 
+    def _build_tool_calls(calls: List[Dict[str, Any]]) -> List[ChatCompletionMessageFunctionToolCallParam]:
+        built: List[ChatCompletionMessageFunctionToolCallParam] = []
+        for call in calls:
+            name = call.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            call_id_raw = call.get("id")
+            call_id = str(call_id_raw) if call_id_raw is not None else "call_0"
+            arguments = call.get("arguments", "{}")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            built.append(
+                ChatCompletionMessageFunctionToolCallParam(
+                    id=call_id,
+                    type="function",
+                    function={"name": name, "arguments": arguments},
+                )
+            )
+        return built
+
     for pc_entry in prompt_completion_list:
         messages: List[ChatCompletionMessageParam] = []
 
@@ -136,16 +268,13 @@ def convert_to_openai_messages(prompt_completion_list: List[_RawSpanInfo]) -> Ge
             if role == "assistant" and "tool_calls" in msg:
                 # Use the tool_calls directly
                 # This branch is usually not used in the wild.
-                tool_calls: List[ChatCompletionMessageFunctionToolCallParam] = [
-                    ChatCompletionMessageFunctionToolCallParam(
-                        id=call["id"],
-                        type="function",
-                        function={"name": call["name"], "arguments": call["arguments"]},
-                    )
-                    for call in msg["tool_calls"]
-                ]
+                tool_calls = _build_tool_calls(cast(List[Dict[str, Any]], msg["tool_calls"]))
                 messages.append(
-                    ChatCompletionAssistantMessageParam(role="assistant", content=None, tool_calls=tool_calls)
+                    ChatCompletionAssistantMessageParam(
+                        role="assistant",
+                        content=msg.get("content"),
+                        tool_calls=tool_calls,
+                    )
                 )
             else:
                 # Normal user/system/tool content
@@ -161,7 +290,13 @@ def convert_to_openai_messages(prompt_completion_list: List[_RawSpanInfo]) -> Ge
         for comp in pc_entry["completion"]:
             if comp.get("role") == "assistant":
                 content = comp.get("content")
-                if pc_entry["tools"]:
+                comp_tool_calls_raw = comp.get("tool_calls")
+                if isinstance(comp_tool_calls_raw, list) and comp_tool_calls_raw:
+                    tool_calls = _build_tool_calls(cast(List[Dict[str, Any]], comp_tool_calls_raw))
+                    messages.append(
+                        ChatCompletionAssistantMessageParam(role="assistant", content=content, tool_calls=tool_calls)
+                    )
+                elif pc_entry["tools"]:
                     tool_calls = [
                         ChatCompletionMessageFunctionToolCallParam(
                             id=tool["call"]["id"],
@@ -251,6 +386,14 @@ class TraceToMessages(TraceAdapter[List[OpenAIMessages]]):
             completion = group_genai_dict(attributes, "gen_ai.completion") or []
             request = group_genai_dict(attributes, "gen_ai.request") or {}
             response = group_genai_dict(attributes, "gen_ai.response") or {}
+            if not prompt:
+                prompt = _messages_from_blob(attributes.get("gen_ai.input.messages"))
+            if not completion:
+                completion = _messages_from_blob(attributes.get("gen_ai.output.messages"))
+            if isinstance(request, dict) and "functions" not in request:
+                request_functions = group_genai_dict(attributes, "llm.request.functions")
+                if isinstance(request_functions, list) and request_functions:
+                    request = {**request, "functions": request_functions}
             if not isinstance(prompt, list):
                 raise ValueError(f"Extracted prompt from trace is not a list: {prompt}")
             if not isinstance(completion, list):

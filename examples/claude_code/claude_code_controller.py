@@ -9,6 +9,7 @@ patch application for SWE-bench evaluation tasks.
 
 import datetime
 import logging
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -291,8 +292,28 @@ class ClaudeController:
         def _err(content: str, **meta: Any) -> str:
             return json.dumps({"ok": False, "content": content, "metadata": meta}, ensure_ascii=False)
 
+        def _tool_matches_env(var_name: str) -> bool:
+            raw = os.getenv(var_name, "")
+            if not raw:
+                return False
+            selected = {x.strip() for x in raw.split(",") if x.strip()}
+            return "*" in selected or name in selected
+
+        def _maybe_debug_breakpoint() -> None:
+            # Example: CC_BREAK_ON_TOOL=run_bash (or "*") to break before execution.
+            if _tool_matches_env("CC_BREAK_ON_TOOL"):
+                logger.warning("[tool-loop] Breakpoint before tool execution: tool=%s args=%r", name, args)
+                breakpoint()
+
+        def _maybe_debug_raise() -> None:
+            # Example: CC_RAISE_ON_TOOL=run_bash (or "*") to fail fast in non-interactive runs.
+            if _tool_matches_env("CC_RAISE_ON_TOOL"):
+                raise RuntimeError(f"[tool-loop] Debug stop before tool execution: tool={name} args={args!r}")
+
         try:
             timeout_default = min(120, time_limit * 60)
+            _maybe_debug_raise()
+            _maybe_debug_breakpoint()
 
             if name == "run_bash":
                 cmd = args["cmd"]
@@ -301,8 +322,10 @@ class ClaudeController:
                 if any(x in cmd.lower() for x in blocked):
                     return _err(f"Blocked command: {cmd}", tool=name)
                 full = f"cd /testbed && {cmd}"
+                logger.info("[tool-loop] run_bash dispatch: cmd=%r timeout=%s", full, timeout)
                 out = container.send_command(full, timeout)
                 txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                logger.info("[tool-loop] run_bash completed: output_len=%d", len(txt))
                 return _ok(txt, tool=name, cmd=full, timeout=timeout)
 
             if name == "read_file":
