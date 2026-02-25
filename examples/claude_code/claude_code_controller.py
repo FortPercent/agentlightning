@@ -57,6 +57,28 @@ Output format:
 }
 """
 
+REPLANNING_SYSTEM_PROMPT = """You are an adaptive bug-fixing planner.
+You run in a loop: Plan -> Act -> Observe -> Replan.
+
+Rules:
+- Output ONLY valid JSON.
+- Decide the single BEST next step from latest observations.
+- Keep step focused and executable with tools in one short burst.
+- Each step is exactly one turn. Always set `max_turns` to 1.
+- If the task appears complete, set `stop` to true.
+
+Output schema:
+{
+  "stop": false,
+  "reason": "why this next step",
+  "step": {
+    "name": "short_slug",
+    "instruction": "concrete instruction for the next action",
+    "max_turns": 1
+  }
+}
+"""
+
 SWEBENCH_USER_PROMPT = """
 You are given a code repository in the current directory (/testbed).
 The bug description is:
@@ -157,6 +179,7 @@ class ClaudeController:
         self.api_key = api_key
         self.container: Runtime = self.init_container(self.image, self.instance)
         self._log: StreamLogger = StreamLogger(None)  # replaced by run_instance when stream_path is set
+        self._last_tool_loop_turns: int = 0
 
     def init_container(self, image: str, instance: SWEbenchInstance) -> Runtime:
         """Initializes the Docker container and sets up the Claude Code environment.
@@ -511,7 +534,9 @@ class ClaudeController:
         except Exception:
             pass
 
+        turns_used = 0
         for turn in range(max_turns):
+            turns_used = turn + 1
             payload = {
                 "model": model,
                 "messages": _normalize_messages_for_api(messages),
@@ -635,6 +660,7 @@ class ClaudeController:
             for tr in tool_results:
                 messages.append({"role": "tool", **tr})
 
+        self._last_tool_loop_turns = turns_used
         return final_text
 
     def _run_sub_agent(
@@ -660,8 +686,21 @@ class ClaudeController:
             The SubAgent with the `result` field filled in.
         """
         logger.info(f"[sub-agent] Starting sub-agent: {sub.name}")
-        self._log.emit(type="step_start", step=sub.name, instruction=sub.instruction, max_turns=sub.max_turns)
+        # Enforce single-turn semantics: one step == one turn.
+        effective_max_turns = 1
+        self._log.emit(type="step_start", step=sub.name, instruction=sub.instruction, max_turns=effective_max_turns)
 
+        messages = self._build_sub_agent_messages(sub, context)
+        sub.max_turns = effective_max_turns
+        sub.result = self._tool_loop(container, messages, effective_max_turns, time_limit)
+
+        logger.info(f"[sub-agent] Completed sub-agent: {sub.name}")
+        self._log.emit(type="step_end", step=sub.name, result=sub.result[:1000])
+
+        return sub
+
+    def _build_sub_agent_messages(self, sub: SubAgent, context: str) -> List[Dict[str, Any]]:
+        """Build initial chat messages for a sub-agent."""
         system_prompt = (
             SWEBENCH_EXTRA_SYSTEM_PROMPT
             + "\n\nYou are working on a specific step of a multi-step task."
@@ -673,17 +712,25 @@ class ClaudeController:
             user_prompt += f"Context from previous steps:\n{context}\n\n"
         user_prompt += f"Your current task:\n{sub.instruction}"
 
-        messages = [
+        return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-        sub.result = self._tool_loop(container, messages, sub.max_turns, time_limit)
-
-        logger.info(f"[sub-agent] Completed sub-agent: {sub.name}")
-        self._log.emit(type="step_end", step=sub.name, result=sub.result[:1000])
-
-        return sub
+    def _latest_assistant_text(self, messages: List[Dict[str, Any]]) -> str:
+        """Extract the latest assistant text from a message list."""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return "".join(
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+        return ""
 
     def _run_sub_agents_parallel(
         self,
@@ -868,50 +915,199 @@ class ClaudeController:
             logger.warning(f"[planner] Plan generation failed ({e}), falling back to default plan")
             return self._get_default_plan(instance, max_turns)
 
+    def _format_replan_history(self, history: List[Dict[str, Any]], max_items: int = 6) -> str:
+        """Format recent Plan/Act/Observe records for replanning."""
+        if not history:
+            return "No previous cycles yet."
+        blocks: List[str] = []
+        for item in history[-max_items:]:
+            blocks.append(
+                f"[cycle {item.get('cycle', '?')}] step={item.get('name', 'unknown')} "
+                f"turns={item.get('turns_used', '?')}\n"
+                f"Result:\n{str(item.get('result', ''))[:800]}\n"
+                f"Observation:\n{str(item.get('observation', ''))[:800]}"
+            )
+        return "\n\n".join(blocks)
+
+    def _collect_replan_observation(self) -> str:
+        """Collect lightweight repo feedback after a step execution."""
+        snippets: List[str] = []
+        try:
+            diff_stat = self.container.send_command("cd /testbed && git --no-pager diff --stat", timeout=30).output.strip()
+            snippets.append(f"git diff --stat:\n{diff_stat[:1200]}")
+        except Exception as e:
+            snippets.append(f"git diff --stat failed: {e}")
+        try:
+            diff_names = self.container.send_command("cd /testbed && git --no-pager diff --name-only", timeout=30).output.strip()
+            snippets.append(f"modified files:\n{diff_names[:800]}")
+        except Exception as e:
+            snippets.append(f"git diff --name-only failed: {e}")
+        return "\n\n".join(snippets)
+
+    def _generate_next_step(
+        self,
+        instance: SWEbenchInstance,
+        history: List[Dict[str, Any]],
+        remaining_turns: int,
+        time_limit: int,
+        model: str = "claude-sonnet-4-5-20250929",
+    ) -> Dict[str, Any]:
+        """Generate the next step using Plan->Act->Observe->Replan context."""
+        url = f"{self.endpoint}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        history_text = self._format_replan_history(history)
+        planning_user_prompt = (
+            f"Bug description:\n{instance['problem_statement']}\n\n"
+            f"Remaining turn budget: {remaining_turns}\n\n"
+            f"Recent execution history:\n{history_text}\n\n"
+            "Choose the NEXT best step."
+        )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": REPLANNING_SYSTEM_PROMPT},
+                {"role": "user", "content": planning_user_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 768,
+        }
+
+        try:
+            logger.info("[planner] Requesting next adaptive step...")
+            resp = requests.post(url, headers=headers, json=payload, timeout=time_limit * 60)
+            resp.raise_for_status()
+            data = resp.json()
+
+            choices: List[Any] = data.get("choices") or [{}]
+            raw_content: str = str(choices[0].get("message", {}).get("content", "") or "")
+            logger.info(f"[planner] Raw adaptive response: {raw_content[:500]}")
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content.strip(), flags=re.MULTILINE).strip()
+            plan_data: Dict[str, Any] = json.loads(cleaned)
+
+            if bool(plan_data.get("stop", False)):
+                return {"stop": True, "reason": str(plan_data.get("reason", "")).strip()}
+
+            step_raw = cast(Dict[str, Any], plan_data.get("step") or {})
+            step_name = str(step_raw.get("name", "next_step")).strip()
+            instruction = str(step_raw.get("instruction", "")).strip()
+            if not instruction:
+                raise ValueError("Adaptive planner returned empty instruction")
+            mt = 1
+            return {
+                "stop": False,
+                "reason": str(plan_data.get("reason", "")).strip(),
+                "step": SubAgent(name=step_name, instruction=instruction, max_turns=mt),
+            }
+        except Exception as e:
+            logger.warning(f"[planner] Adaptive planning failed ({e}), using fallback next-step")
+            if history:
+                fallback = SubAgent(
+                    name="fix_retry",
+                    instruction=(
+                        "Use the latest observations to make a targeted fix. "
+                        "Run a focused test command that verifies the bug status, then update code."
+                    ),
+                    max_turns=1,
+                )
+            else:
+                fallback = SubAgent(
+                    name="reproduce",
+                    instruction=(
+                        "Reproduce the bug with a concrete test or command, capture exact failure output, "
+                        "and identify likely source files to modify."
+                    ),
+                    max_turns=1,
+                )
+            return {"stop": False, "reason": "fallback", "step": fallback}
+
     def _run_multistep(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> str:
         """Multi-step pipeline execution with independent sub-agents.
 
         Args:
             instance: The SWE-bench instance.
-            max_turns: Total turns to distribute across steps.
+            max_turns: Total step budget. Each step consumes exactly one turn.
             time_limit: Time limit for each step in minutes.
 
         Returns:
             Summary of the final step.
         """
-        logger.info("[multi-step] Starting multi-step pipeline")
+        logger.info("[multi-step] Starting adaptive Plan->Act->Observe->Replan loop")
         t0 = time.monotonic()
         instance_id: str = str(instance.get("instance_id", "unknown"))  # type: ignore[attr-defined]
         self._log.emit(type="start", instance_id=instance_id, max_turns=max_turns, time_limit=time_limit)
+        remaining_turns = max_turns
+        cycle = 0
+        max_cycles = max_turns
+        history: List[Dict[str, Any]] = []
 
-        # Let the LLM generate an execution plan for this bug
-        steps = self._generate_plan(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
-        self._log.emit(type="plan", steps=[{"name": s.name, "max_turns": s.max_turns} for s in steps])
+        while remaining_turns > 0 and cycle < max_cycles:
+            cycle += 1
+            logger.info(f"[multi-step] Starting cycle {cycle} (remaining turns: {remaining_turns})")
 
-        # Execute steps sequentially
-        step_summaries: List[str] = []
-        completed: Dict[str, SubAgent] = {}
+            plan = self._generate_next_step(instance, history, remaining_turns, time_limit)
+            plan_reason = str(plan.get("reason", ""))
+            if bool(plan.get("stop", False)):
+                logger.info(f"[multi-step] Planner requested stop at cycle {cycle}: {plan_reason}")
+                self._log.emit(type="cycle_stop", cycle=cycle, reason=plan_reason, remaining_turns=remaining_turns)
+                break
 
-        # All steps share self.container — changes accumulate naturally,
-        # just like a human engineer working in one terminal throughout.
-        for step in steps:
-            context = "\n".join(step_summaries)
-            logger.info(f"[multi-step] Starting step: {step.name}")
-            step = self._run_sub_agent(step, self.container, context, time_limit)
-            completed[step.name] = step
-            step_summaries.append(f"[{step.name}]: {step.result[:500]}")
-            logger.info(f"[multi-step] Completed step: {step.name}")
+            sub = cast(SubAgent, plan["step"])
+            sub.max_turns = 1
+            context = self._format_replan_history(history)
+            self._log.emit(
+                type="cycle_plan",
+                cycle=cycle,
+                step=sub.name,
+                reason=plan_reason,
+                step_max_turns=sub.max_turns,
+                remaining_turns=remaining_turns,
+            )
+
+            logger.info(
+                "[multi-step] Cycle %s executing step=%s budget=%s reason=%s",
+                cycle,
+                sub.name,
+                sub.max_turns,
+                plan_reason[:200],
+            )
+            sub = self._run_sub_agent(sub, self.container, context, time_limit)
+            turns_used = 1
+            remaining_turns -= turns_used
+            observation = self._collect_replan_observation()
+
+            history_item = {
+                "cycle": cycle,
+                "name": sub.name,
+                "turns_used": turns_used,
+                "result": sub.result,
+                "observation": observation,
+            }
+            history.append(history_item)
+            self._log.emit(
+                type="cycle_observe",
+                cycle=cycle,
+                step=sub.name,
+                turns_used=turns_used,
+                remaining_turns=remaining_turns,
+                result=sub.result[:1000],
+                observation=observation[:2000],
+            )
 
         elapsed = round(time.monotonic() - t0, 1)
-        logger.info("[multi-step] Multi-step pipeline completed")
+        logger.info("[multi-step] Adaptive loop completed")
         self._log.emit(
             type="end",
             instance_id=instance_id,
-            n_steps=len(completed),
-            steps_completed=list(completed.keys()),
+            n_steps=len(history),
+            steps_completed=[str(item.get("name", "")) for item in history],
+            turns_used=max_turns - remaining_turns,
             elapsed_seconds=elapsed,
         )
-        return step_summaries[-1] if step_summaries else ""
+        return str(history[-1]["result"]) if history else ""
 
     def _run_openai_tools(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> str:
         """Multi-turn tool loop tailored for Qwen XML-style tool calling.
