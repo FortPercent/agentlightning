@@ -686,8 +686,8 @@ class ClaudeController:
             The SubAgent with the `result` field filled in.
         """
         logger.info(f"[sub-agent] Starting sub-agent: {sub.name}")
-        # Enforce single-turn semantics: one step == one turn.
-        effective_max_turns = 1
+        # Use per-step budget from planning output (or fallback to 1).
+        effective_max_turns = max(1, int(sub.max_turns or 1))
         self._log.emit(type="step_start", step=sub.name, instruction=sub.instruction, max_turns=effective_max_turns)
 
         messages = self._build_sub_agent_messages(sub, context)
@@ -1029,7 +1029,7 @@ class ClaudeController:
 
         Args:
             instance: The SWE-bench instance.
-            max_turns: Total step budget. Each step consumes exactly one turn.
+            max_turns: Total turn budget across all planned steps.
             time_limit: Time limit for each step in minutes.
 
         Returns:
@@ -1041,8 +1041,8 @@ class ClaudeController:
         self._log.emit(type="start", instance_id=instance_id, max_turns=max_turns, time_limit=time_limit)
         steps = self._generate_plan(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
         for step in steps:
-            # Keep one-step-one-turn behavior even with pre-generated plans.
-            step.max_turns = 1
+            # Keep planner-provided max_turns, but ensure it is at least 1.
+            step.max_turns = max(1, int(step.max_turns or 1))
         self._log.emit(type="plan", steps=[{"name": s.name, "max_turns": s.max_turns} for s in steps], planning_mode="pre_generated")
 
         remaining_turns = max_turns
@@ -1061,19 +1061,21 @@ class ClaudeController:
                 len(steps),
                 step.name,
             )
-            step.max_turns = 1
+            # Enforce global budget: a step may use at most remaining turns.
+            step.max_turns = min(step.max_turns, remaining_turns)
             step = self._run_sub_agent(step, self.container, context, time_limit)
             completed[step.name] = step
-            remaining_turns -= 1
+            turns_used = max(1, int(getattr(self, "_last_tool_loop_turns", 1)))
+            remaining_turns = max(0, remaining_turns - turns_used)
 
             observation = self._collect_replan_observation()
             step_summaries.append(
-                f"[{step.name}] turns=1\nResult:\n{step.result[:500]}\nObservation:\n{observation[:500]}"
+                f"[{step.name}] turns={turns_used}\nResult:\n{step.result[:500]}\nObservation:\n{observation[:500]}"
             )
             self._log.emit(
                 type="step_observe",
                 step=step.name,
-                turns_used=1,
+                turns_used=turns_used,
                 remaining_turns=remaining_turns,
                 observation=observation[:2000],
             )
