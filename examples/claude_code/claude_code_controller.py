@@ -1025,7 +1025,7 @@ class ClaudeController:
             return {"stop": False, "reason": "fallback", "step": fallback}
 
     def _run_multistep(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> str:
-        """Multi-step pipeline execution with independent sub-agents.
+        """Multi-step pipeline execution with a pre-generated N-step plan.
 
         Args:
             instance: The SWE-bench instance.
@@ -1035,79 +1035,60 @@ class ClaudeController:
         Returns:
             Summary of the final step.
         """
-        logger.info("[multi-step] Starting adaptive Plan->Act->Observe->Replan loop")
+        logger.info("[multi-step] Starting planned multi-step pipeline")
         t0 = time.monotonic()
         instance_id: str = str(instance.get("instance_id", "unknown"))  # type: ignore[attr-defined]
         self._log.emit(type="start", instance_id=instance_id, max_turns=max_turns, time_limit=time_limit)
+        steps = self._generate_plan(instance, max_turns, time_limit)  # type: ignore[no-untyped-call]
+        for step in steps:
+            # Keep one-step-one-turn behavior even with pre-generated plans.
+            step.max_turns = 1
+        self._log.emit(type="plan", steps=[{"name": s.name, "max_turns": s.max_turns} for s in steps], planning_mode="pre_generated")
+
         remaining_turns = max_turns
-        cycle = 0
-        max_cycles = max_turns
-        history: List[Dict[str, Any]] = []
+        step_summaries: List[str] = []
+        completed: Dict[str, SubAgent] = {}
 
-        while remaining_turns > 0 and cycle < max_cycles:
-            cycle += 1
-            logger.info(f"[multi-step] Starting cycle {cycle} (remaining turns: {remaining_turns})")
-
-            plan = self._generate_next_step(instance, history, remaining_turns, time_limit)
-            plan_reason = str(plan.get("reason", ""))
-            if bool(plan.get("stop", False)):
-                logger.info(f"[multi-step] Planner requested stop at cycle {cycle}: {plan_reason}")
-                self._log.emit(type="cycle_stop", cycle=cycle, reason=plan_reason, remaining_turns=remaining_turns)
+        for idx, step in enumerate(steps, start=1):
+            if remaining_turns <= 0:
+                logger.info("[multi-step] Turn budget exhausted, stopping early")
                 break
 
-            sub = cast(SubAgent, plan["step"])
-            sub.max_turns = 1
-            context = self._format_replan_history(history)
-            self._log.emit(
-                type="cycle_plan",
-                cycle=cycle,
-                step=sub.name,
-                reason=plan_reason,
-                step_max_turns=sub.max_turns,
-                remaining_turns=remaining_turns,
-            )
-
+            context = "\n".join(step_summaries)
             logger.info(
-                "[multi-step] Cycle %s executing step=%s budget=%s reason=%s",
-                cycle,
-                sub.name,
-                sub.max_turns,
-                plan_reason[:200],
+                "[multi-step] Executing planned step %s/%s: %s",
+                idx,
+                len(steps),
+                step.name,
             )
-            sub = self._run_sub_agent(sub, self.container, context, time_limit)
-            turns_used = 1
-            remaining_turns -= turns_used
-            observation = self._collect_replan_observation()
+            step.max_turns = 1
+            step = self._run_sub_agent(step, self.container, context, time_limit)
+            completed[step.name] = step
+            remaining_turns -= 1
 
-            history_item = {
-                "cycle": cycle,
-                "name": sub.name,
-                "turns_used": turns_used,
-                "result": sub.result,
-                "observation": observation,
-            }
-            history.append(history_item)
+            observation = self._collect_replan_observation()
+            step_summaries.append(
+                f"[{step.name}] turns=1\nResult:\n{step.result[:500]}\nObservation:\n{observation[:500]}"
+            )
             self._log.emit(
-                type="cycle_observe",
-                cycle=cycle,
-                step=sub.name,
-                turns_used=turns_used,
+                type="step_observe",
+                step=step.name,
+                turns_used=1,
                 remaining_turns=remaining_turns,
-                result=sub.result[:1000],
                 observation=observation[:2000],
             )
 
         elapsed = round(time.monotonic() - t0, 1)
-        logger.info("[multi-step] Adaptive loop completed")
+        logger.info("[multi-step] Planned multi-step pipeline completed")
         self._log.emit(
             type="end",
             instance_id=instance_id,
-            n_steps=len(history),
-            steps_completed=[str(item.get("name", "")) for item in history],
+            n_steps=len(completed),
+            steps_completed=list(completed.keys()),
             turns_used=max_turns - remaining_turns,
             elapsed_seconds=elapsed,
         )
-        return str(history[-1]["result"]) if history else ""
+        return step_summaries[-1] if step_summaries else ""
 
     def _run_openai_tools(self, instance: SWEbenchInstance, max_turns: int, time_limit: int) -> str:
         """Multi-turn tool loop tailored for Qwen XML-style tool calling.
