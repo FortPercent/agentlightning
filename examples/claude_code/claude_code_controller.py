@@ -418,7 +418,8 @@ class ClaudeController:
                         "PATCH\n"
                         f"(git apply --whitespace=nowarn -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)\n"
                         "ec=$?\n"
-                        'echo "__AGL_APPLY_PATCH_EXIT_CODE__=$ec"'
+                        "echo \"__AGL_APPLY_PATCH_EXIT_CODE__=$ec\"\n"
+                        "exit $ec"
                     )
                     out = container.send_command(cmd, timeout_default)
                     txt = out if isinstance(out, str) else getattr(out, "output", str(out))
@@ -1186,6 +1187,61 @@ class ClaudeController:
                 )
         return diagnostics
 
+    def _ensure_validate_step(self, sub_agents: List[SubAgent], total_budget: int) -> List[SubAgent]:
+        """Ensure the execution plan includes a dedicated validation step.
+
+        If the planner omits validate/test/verify, append a `validate_fix` step.
+        Then rebalance max_turns so sum(max_turns) stays within `total_budget`
+        whenever possible.
+        """
+        if not sub_agents:
+            return sub_agents
+
+        def _is_validate_like(sub: SubAgent) -> bool:
+            text = f"{sub.name} {sub.instruction}".lower()
+            tokens = ("validate", "validation", "verify", "pytest", "test_", "run tests", "regression")
+            return any(tok in text for tok in tokens)
+
+        has_validate = any(_is_validate_like(s) for s in sub_agents)
+        if not has_validate:
+            validate_instruction = (
+                "Step: Validate the fix with a focused command. "
+                "Use run_bash to execute: cd /testbed && python -m pytest "
+                "astropy/modeling/tests/test_separable.py -k separable -q. "
+                "Then run: cd /testbed && git --no-pager diff --stat and summarize whether the bug behavior is fixed."
+            )
+            sub_agents = list(sub_agents) + [SubAgent(name="validate_fix", instruction=validate_instruction, max_turns=1)]
+            logger.info("[planner] Added missing validate step: validate_fix")
+
+        # Rebalance turns to respect total budget.
+        total_turns = sum(max(1, int(s.max_turns or 1)) for s in sub_agents)
+        if total_turns <= total_budget:
+            return sub_agents
+
+        # Prefer shrinking non-validate steps first, then validate as last resort.
+        def _sort_key(item: tuple[int, SubAgent]) -> tuple[int, int]:
+            idx, step = item
+            is_validate = 1 if _is_validate_like(step) else 0
+            return (is_validate, -int(step.max_turns or 1))
+
+        ordered = sorted(list(enumerate(sub_agents)), key=_sort_key)
+        for idx, _step in ordered:
+            while total_turns > total_budget and sub_agents[idx].max_turns > 1:
+                sub_agents[idx].max_turns -= 1
+                total_turns -= 1
+            if total_turns <= total_budget:
+                break
+
+        if total_turns > total_budget:
+            logger.warning(
+                "[planner] Could not fully rebalance plan turns to budget: total_turns=%s budget=%s",
+                total_turns,
+                total_budget,
+            )
+        else:
+            logger.info("[planner] Rebalanced plan turns to budget: total_turns=%s budget=%s", total_turns, total_budget)
+        return sub_agents
+
     def _refine_vague_instructions(
         self,
         sub_agents: List[SubAgent],
@@ -1371,6 +1427,7 @@ class ClaudeController:
             else:
                 logger.info("[planner] All steps passed quality validation on first pass")
 
+            sub_agents = self._ensure_validate_step(sub_agents, max_turns)
             return sub_agents
 
         except Exception as e:

@@ -193,30 +193,56 @@ class ClaudeCodeAgent(LitAgent[SWEbenchInstance]):
         reward = 0.0
         # empty patch
         if prediction["model_patch"] in ["", None]:
+            logger.info(f"[evaluation] model_patch is empty for {task['instance_id']}, skipping evaluation")
             return reward
 
         instance_id = prediction["instance_id"]
+        logger.info(f"[evaluation] Starting evaluation for {instance_id}, patch length={len(prediction['model_patch'])}")
 
-        result = evaluate(
-            cast(Any, prediction),
-            self.swebench_full_dataset[instance_id],
-            self.cache_level,
-            self.clean,
-            self.force_rebuild,
-            run_id,
-            self.timeout,
-            namespace=self.namespace,
-            instance_image_tag=self.instance_image_tag,
-            rewrite_reports=self.rewrite_reports,
-        )
+        # Clear stale evaluation cache to force re-evaluation with the new patch.
+        # Without this, evaluation.py's run_instance() finds a report.json from
+        # a previous run and returns it immediately, ignoring the new patch.
+        try:
+            from swebench.harness.constants import RUN_EVALUATION_LOG_DIR, LOG_REPORT, KEY_MODEL
+            model_name = prediction.get(KEY_MODEL, "None").replace("/", "__")
+            cached_report = RUN_EVALUATION_LOG_DIR / run_id / model_name / instance_id / LOG_REPORT
+            if cached_report.exists():
+                logger.info(f"[evaluation] Removing stale cached report: {cached_report}")
+                cached_report.unlink()
+        except Exception as cache_err:
+            logger.warning(f"[evaluation] Failed to clear cache: {cache_err}")
+
+        try:
+            import time as _time
+            eval_start = _time.time()
+            result = evaluate(
+                cast(Any, prediction),
+                self.swebench_full_dataset[instance_id],
+                self.cache_level,
+                self.clean,
+                self.force_rebuild,
+                run_id,
+                self.timeout,
+                namespace=self.namespace,
+                instance_image_tag=self.instance_image_tag,
+                rewrite_reports=self.rewrite_reports,
+            )
+            eval_elapsed = _time.time() - eval_start
+            logger.info(f"[evaluation] evaluate() completed in {eval_elapsed:.1f}s, result is {'None' if result is None else 'present'}")
+        except Exception as eval_err:
+            logger.error(f"[evaluation] evaluate() raised exception: {eval_err}", exc_info=True)
+            return reward
 
         # error patch
         if result is None:
+            logger.info(f"[evaluation] evaluate() returned None for {instance_id}")
             return reward
 
         report = result[1]
+        resolved = report[instance_id]["resolved"]
+        logger.info(f"[evaluation] {instance_id} resolved={resolved}")
         # resolved/unresolved patch
-        if report[instance_id]["resolved"]:
+        if resolved:
             reward = 1.0
         return reward
 
