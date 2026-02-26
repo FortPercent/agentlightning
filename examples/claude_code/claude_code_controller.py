@@ -406,17 +406,72 @@ class ClaudeController:
 
             if name == "apply_patch":
                 patch = args["patch"]
-                strip = int(args.get("strip", 0))
-                cmd = (
-                    "cd /testbed && "
-                    "cat > /tmp/agent.patch <<'PATCH'\n"
-                    f"{patch}\n"
-                    "PATCH\n"
-                    f"(git apply --whitespace=nowarn -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)"
+                strip_arg = args.get("strip", None)
+                strip_candidates = [int(strip_arg)] if strip_arg is not None else [1, 0]
+                attempt_logs: List[str] = []
+
+                for strip in strip_candidates:
+                    cmd = (
+                        "cd /testbed && "
+                        "cat > /tmp/agent.patch <<'PATCH'\n"
+                        f"{patch}\n"
+                        "PATCH\n"
+                        f"(git apply --whitespace=nowarn -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)\n"
+                        "ec=$?\n"
+                        "echo \"__AGL_APPLY_PATCH_EXIT_CODE__=$ec\"\n"
+                        "exit $ec"
+                    )
+                    out = container.send_command(cmd, timeout_default)
+                    txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+
+                    marker_match = re.search(r"__AGL_APPLY_PATCH_EXIT_CODE__=(\d+)", txt)
+                    marker_exit: Optional[int] = int(marker_match.group(1)) if marker_match else None
+                    meta = None if isinstance(out, str) else getattr(out, "metadata", None)
+                    meta_exit = None if meta is None else getattr(meta, "exit_code", None)
+                    exit_code: Optional[int]
+                    if marker_exit is not None:
+                        exit_code = marker_exit
+                    elif meta_exit is not None:
+                        exit_code = int(meta_exit)
+                    else:
+                        exit_code = None
+
+                    cleaned_txt = re.sub(r"\n?__AGL_APPLY_PATCH_EXIT_CODE__=\d+\s*$", "", txt).strip()
+                    if exit_code == 0:
+                        return _ok(cleaned_txt, tool=name, strip=strip, tried_strips=strip_candidates)
+
+                    attempt_logs.append(
+                        f"[strip={strip} exit_code={exit_code}]\n"
+                        f"{cleaned_txt if cleaned_txt else '(no stderr/stdout output)'}"
+                    )
+
+                diag_txt = ""
+                try:
+                    diag_cmd = (
+                        "cd /testbed && "
+                        "echo '=== git status --short ===' && git status --short && "
+                        "echo '=== git diff --stat ===' && git --no-pager diff --stat && "
+                        "echo '=== patch preview (/tmp/agent.patch) ===' && sed -n '1,120p' /tmp/agent.patch"
+                    )
+                    diag_out = container.send_command(diag_cmd, timeout_default)
+                    diag_txt = (
+                        diag_out
+                        if isinstance(diag_out, str)
+                        else getattr(diag_out, "output", str(diag_out))
+                    ).strip()
+                except Exception as diag_err:
+                    diag_txt = f"(failed to collect diagnostics: {type(diag_err).__name__}: {diag_err})"
+
+                return _err(
+                    (
+                        ("\n\n".join(attempt_logs) if attempt_logs else "apply_patch failed with unknown error")
+                        + "\n\n=== post-failure diagnostics ===\n"
+                        + diag_txt
+                    ),
+                    tool=name,
+                    strip=strip_arg,
+                    tried_strips=strip_candidates,
                 )
-                out = container.send_command(cmd, timeout_default)
-                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
-                return _ok(txt, tool=name, strip=strip)
 
             return _err(f"Unknown tool: {name}", tool=name, args=args)
 
@@ -659,14 +714,18 @@ class ClaudeController:
                     parsed = json.loads(result_str)
                     ok = parsed.get("ok")
                     content = str(parsed.get("content", ""))
+                    preview_limit = 200 if ok else 2000
                     end_msg = (
                         f"[tool-loop] TOOL_END id={tcid} name={fn_name} ok={ok} "
-                        f"content_preview={content[:200]!r}"
+                        f"content_preview={content[:preview_limit]!r}"
                     )
                 except Exception:
                     end_msg = f"[tool-loop] TOOL_END id={tcid} name={fn_name} raw_preview={result_str[:200]!r}"
                 print(end_msg)
-                logger.info(end_msg)
+                if " ok=False " in end_msg:
+                    logger.error(end_msg)
+                else:
+                    logger.info(end_msg)
                 self._log.emit(type="tool_result", tool=fn_name, args=fn_args, result=result_str[:2000])
                 return {"tool_call_id": tcid, "name": fn_name, "content": result_str}
 
@@ -1674,9 +1733,9 @@ fi
         finally:
             self._log.close()
 
-        result = self.container.send_command("git --no-pager diff HEAD")
+        result = self.container.send_command("cd /testbed && git --no-pager diff HEAD")
         logger.info(f"====== Result: {result} ==========")
-        git_diff = result.output.replace("git --no-pager diff HEAD\n", "")
+        git_diff = result.output.replace("cd /testbed && git --no-pager diff HEAD\n", "")
         logger.info(f"====== git_diff: {git_diff} ==========")
         return {
             "instance_id": instance["instance_id"],
