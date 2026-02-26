@@ -35,7 +35,7 @@ Tool calling guidelines:
 """
 
 PLANNING_SYSTEM_PROMPT = """You are a planning agent for software bug-fixing tasks.
-Given a bug description and a total turn budget, output a JSON execution plan.
+Given a bug description, repository exploration results, and a total turn budget, output a JSON execution plan.
 
 Critical output rules:
 - Output ONLY valid JSON. No prose, no markdown, no prefixes.
@@ -48,21 +48,34 @@ Plan rules:
   - "instruction": concrete executable task
   - "max_turns": integer >= 1
 - Steps are executed sequentially.
-- Typical workflow: reproduce, locate, fix, validate.
+- Typical workflow is reproduce -> locate -> fix -> validate, but adapt to this bug.
+- Every instruction must reference at least one concrete bug artifact (function/class/file/test/symbol) from the bug description.
+- Do not use boilerplate-only instructions such as "inspect code", "fix bug", or "run tests" without specific targets.
+- Do not repeat semantically identical instructions across steps.
 - Total budget constraint is strict:
   - sum(step.max_turns for step in steps) <= TOTAL_TURN_BUDGET
 - Prefer 3-5 steps unless clearly necessary.
 
+IMPORTANT - You are given REPO EXPLORATION RESULTS below.
+Use them to write CONCRETE instructions with:
+- Exact file paths (e.g. /testbed/astropy/modeling/separable.py)
+- Exact function/class names found in the source
+- Exact test file paths
+- Specific line ranges or code snippets when relevant
+
+IMPORTANT for fix/apply steps:
+- The fix step instruction MUST specify the exact file path and function/class to modify.
+- The fix step should describe WHAT needs to change, not just "fix the bug".
+- Give the fix step at least 2 max_turns so the agent can read the file and then write the patch.
+- Example good instruction: "Read /testbed/astropy/modeling/separable.py. In the _separable function (around line 85), the left and right separability matrices are combined using np.ones for the 'and' operator case. For nested CompoundModels where the sub-model already has a separability matrix, use the existing matrix instead of np.ones. Apply the fix using write_file."
+- Example bad instruction: "Fix the separability computation logic"
+
 Output schema:
 {
   "steps": [
-    {"name": "reproduce", "instruction": "...", "max_turns": 1},
-    {"name": "locate",    "instruction": "...", "max_turns": 1},
-    {"name": "fix",       "instruction": "...", "max_turns": 2},
-    {"name": "validate",  "instruction": "...", "max_turns": 1}
+    {"name": "step_name", "instruction": "specific instruction with exact paths", "max_turns": 2}
   ]
-}
-"""
+}"""
 
 REPLANNING_SYSTEM_PROMPT = """You are an adaptive bug-fixing planner.
 You run in a loop: Plan -> Act -> Observe -> Replan.
@@ -712,6 +725,11 @@ class ClaudeController:
             SWEBENCH_EXTRA_SYSTEM_PROMPT
             + "\n\nYou are working on a specific step of a multi-step task."
             + "\nFocus only on your assigned task."
+            + "\n\nBefore using any tool, first analyze:"
+            + "\n1. What has been accomplished in previous steps?"
+            + "\n2. What specific information from the context is relevant to your task?"
+            + "\n3. What exact actions do you need to take?"
+            + "\nThen execute your actions based on that analysis."
         )
 
         user_prompt = ""
@@ -846,6 +864,329 @@ class ClaudeController:
             ),
         ]
 
+    def _explore_repo_for_planning(
+        self,
+        instance: SWEbenchInstance,
+        time_limit: int,
+    ) -> str:
+        """Explore the repository to gather concrete context for planning.
+
+        This is the key difference from blind planning: the orchestrator first
+        gathers real information about the repo (file structure, source code of
+        relevant modules, test files) so the planner can generate instructions
+        with exact file paths, function names, and line numbers.
+
+        Analogous to the "main agent" in the screenshot doing `ls -la` before
+        spawning sub-agents with specific file paths.
+
+        Args:
+            instance: The SWE-bench instance containing the problem statement.
+            time_limit: Timeout in minutes.
+
+        Returns:
+            A string containing structured exploration results.
+        """
+        logger.info("[orchestrator] Exploring repo before planning...")
+        exploration_results: List[str] = []
+        timeout = min(30, time_limit * 60)
+
+        # --- Phase 1: Repo structure ---
+        try:
+            out = self.container.send_command(
+                "cd /testbed && find . -maxdepth 2 -type f -name '*.py' | head -60",
+                timeout,
+            )
+            txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+            exploration_results.append(f"## Repository Python files (top 2 levels):\n{txt[:3000]}")
+        except Exception as e:
+            exploration_results.append(f"## Repo structure: failed ({e})")
+
+        # --- Phase 2: Extract keywords from bug description and grep ---
+        problem = instance["problem_statement"]
+        # Extract likely module/function/class names from the problem statement
+        # Look for Python identifiers in backticks, import statements, etc.
+        import_pattern = re.compile(r'(?:from|import)\s+([\w.]+)', re.MULTILINE)
+        backtick_pattern = re.compile(r'`([\w.]+)`')
+        candidates: List[str] = []
+        for m in import_pattern.finditer(problem):
+            candidates.append(m.group(1))
+        for m in backtick_pattern.finditer(problem):
+            candidates.append(m.group(1))
+        # Deduplicate while preserving order
+        seen: set = set()
+        unique_candidates: List[str] = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                unique_candidates.append(c)
+
+        if unique_candidates:
+            exploration_results.append(f"## Keywords extracted from bug description: {unique_candidates}")
+
+        # --- Phase 3: Find the relevant source files ---
+        for keyword in unique_candidates[:5]:  # limit to top 5 keywords
+            # Convert module path to file path (e.g., astropy.modeling.separable -> astropy/modeling/separable)
+            file_path_guess = keyword.replace(".", "/")
+            try:
+                out = self.container.send_command(
+                    f"cd /testbed && find . -path '*{file_path_guess}*' -type f 2>/dev/null | head -10",
+                    timeout,
+                )
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                if txt.strip():
+                    exploration_results.append(f"## Files matching '{keyword}':\n{txt.strip()}")
+            except Exception:
+                pass
+
+        # --- Phase 4: Read the most likely source file ---
+        # Try to find and read the main source file mentioned in the bug
+        for keyword in unique_candidates[:3]:
+            file_path_guess = keyword.replace(".", "/")
+            try:
+                find_cmd = f"cd /testbed && find . -path '*{file_path_guess}.py' -type f 2>/dev/null | head -1"
+                out = self.container.send_command(find_cmd, timeout)
+                found_path = (out if isinstance(out, str) else getattr(out, "output", str(out))).strip()
+                # Remove command echo if present
+                lines = found_path.split("\n")
+                found_path = next((l.strip() for l in lines if l.strip().startswith("./") or l.strip().startswith("/")), "")
+
+                if found_path and found_path.endswith(".py"):
+                    # Read the file outline (first 120 lines + function signatures)
+                    read_cmd = (
+                        f"cd /testbed && head -150 {found_path}"
+                    )
+                    out = self.container.send_command(read_cmd, timeout)
+                    txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                    exploration_results.append(
+                        f"## Source file content (first 150 lines of {found_path}):\n{txt[:4000]}"
+                    )
+
+                    # Also get function/class signatures
+                    grep_cmd = (
+                        f"cd /testbed && grep -n 'def \\|class ' {found_path} | head -30"
+                    )
+                    out = self.container.send_command(grep_cmd, timeout)
+                    txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                    exploration_results.append(
+                        f"## Function/class signatures in {found_path}:\n{txt[:2000]}"
+                    )
+                    break  # Found and read the main file, stop
+            except Exception:
+                pass
+
+        # --- Phase 5: Find test files ---
+        for keyword in unique_candidates[:3]:
+            last_part = keyword.split(".")[-1]
+            try:
+                out = self.container.send_command(
+                    f"cd /testbed && find . -name 'test_{last_part}*' -o -name '*{last_part}*test*' 2>/dev/null | head -5",
+                    timeout,
+                )
+                txt = out if isinstance(out, str) else getattr(out, "output", str(out))
+                if txt.strip():
+                    exploration_results.append(f"## Test files for '{last_part}':\n{txt.strip()}")
+            except Exception:
+                pass
+
+        result = "\n\n".join(exploration_results)
+        logger.info(f"[orchestrator] Exploration completed. Context length: {len(result)} chars")
+        return result
+
+    # ------------------------------------------------------------------ #
+    #                    Plan Quality Validation                           #
+    # ------------------------------------------------------------------ #
+
+    # Words that signal a vague, boilerplate instruction when found WITHOUT
+    # any concrete anchors (file paths, function names, etc.).
+    _VAGUE_PHRASES: List[str] = [
+        "fix the bug",
+        "fix the issue",
+        "fix the logic",
+        "inspect code",
+        "investigate the",
+        "look into the",
+        "explore the codebase",
+        "run tests",
+        "run the tests",
+        "verify the fix",
+    ]
+
+    def _instruction_quality_score(self, instruction: str, step_name: str) -> Dict[str, Any]:
+        """Score an instruction's specificity. Returns a dict with score and diagnostics.
+
+        Scoring criteria:
+        - Has file path (e.g. /testbed/..., ./..., *.py)         → +3
+        - Has function/class name (def xxx, class xxx, `xxx`)    → +2
+        - Has tool action verb (read_file, write_file, run_bash) → +1
+        - Has specific line reference (line XX, around line)     → +1
+        - Instruction length > 80 chars                          → +1
+        - Contains vague-only phrases with no anchors            → -3
+
+        A score < 3 for fix/edit steps is considered "vague".
+        A score < 2 for other steps is considered "vague".
+        """
+        score = 0
+        reasons: List[str] = []
+        instr_lower = instruction.lower()
+
+        # Check for file paths
+        has_path = bool(re.search(r'(?:/testbed/|\./)[\w/.-]+\.py', instruction))
+        if has_path:
+            score += 3
+            reasons.append("has_file_path")
+
+        # Check for function/class names (backtick references or def/class keywords)
+        has_symbol = bool(re.search(r'`\w+`|(?:function|method|class|def)\s+\w+', instruction, re.IGNORECASE))
+        if has_symbol:
+            score += 2
+            reasons.append("has_symbol_ref")
+
+        # Check for tool action verbs
+        tool_verbs = ["read_file", "write_file", "apply_patch", "run_bash", "head ", "grep ", "cat "]
+        if any(v in instr_lower for v in tool_verbs):
+            score += 1
+            reasons.append("has_tool_verb")
+
+        # Check for line number references
+        if re.search(r'line\s+\d+|around line|lines?\s+\d+-\d+', instr_lower):
+            score += 1
+            reasons.append("has_line_ref")
+
+        # Length bonus
+        if len(instruction) > 80:
+            score += 1
+            reasons.append("sufficient_length")
+
+        # Vagueness penalty — only if there are no concrete anchors
+        if not has_path and not has_symbol:
+            for phrase in self._VAGUE_PHRASES:
+                if phrase in instr_lower:
+                    score -= 3
+                    reasons.append(f"vague_phrase:{phrase}")
+                    break
+
+        # Determine threshold based on step type
+        name_lower = step_name.lower()
+        is_fix_step = any(kw in name_lower for kw in ["fix", "apply", "edit", "patch"])
+        threshold = 3 if is_fix_step else 2
+
+        return {
+            "score": score,
+            "threshold": threshold,
+            "is_vague": score < threshold,
+            "is_fix_step": is_fix_step,
+            "reasons": reasons,
+        }
+
+    def _validate_plan_quality(self, sub_agents: List[SubAgent]) -> List[Dict[str, Any]]:
+        """Validate each step's instruction quality. Returns list of diagnostics.
+
+        This is the programmatic guardrail: instead of trusting the LLM to
+        follow prompt instructions, we CHECK the output and flag vague steps.
+        """
+        diagnostics: List[Dict[str, Any]] = []
+        for sub in sub_agents:
+            diag = self._instruction_quality_score(sub.instruction, sub.name)
+            diag["step_name"] = sub.name
+            diag["instruction_preview"] = sub.instruction[:120]
+            diagnostics.append(diag)
+            if diag["is_vague"]:
+                logger.warning(
+                    f"[plan-validator] Step '{sub.name}' scored {diag['score']}/{diag['threshold']} "
+                    f"(vague). Reasons: {diag['reasons']}. Preview: {sub.instruction[:80]!r}"
+                )
+            else:
+                logger.info(
+                    f"[plan-validator] Step '{sub.name}' scored {diag['score']}/{diag['threshold']} (OK)"
+                )
+        return diagnostics
+
+    def _refine_vague_instructions(
+        self,
+        sub_agents: List[SubAgent],
+        diagnostics: List[Dict[str, Any]],
+        repo_context: str,
+        instance: SWEbenchInstance,
+        time_limit: int,
+        model: str = "claude-sonnet-4-5-20250929",
+    ) -> List[SubAgent]:
+        """Rewrite vague instructions using a focused refinement prompt.
+
+        For each step flagged as "vague" by _validate_plan_quality, ask the LLM
+        to rewrite it with concrete file paths, function names, and actions. This
+        is a targeted, per-step call — cheaper and more effective than re-generating
+        the whole plan.
+        """
+        url = f"{self.endpoint}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        refined = list(sub_agents)  # shallow copy
+
+        for i, (sub, diag) in enumerate(zip(sub_agents, diagnostics)):
+            if not diag["is_vague"]:
+                continue
+
+            logger.info(f"[plan-refiner] Refining vague step '{sub.name}': {sub.instruction[:80]!r}")
+
+            refine_prompt = (
+                f"You must rewrite the following sub-agent instruction to be CONCRETE and ACTIONABLE.\n\n"
+                f"Step name: {sub.name}\n"
+                f"Original instruction: {sub.instruction}\n\n"
+                f"Bug description:\n{instance['problem_statement'][:2000]}\n\n"
+                f"Repository exploration results:\n{repo_context[:4000]}\n\n"
+                f"Requirements for the rewritten instruction:\n"
+                f"- MUST include at least one exact file path from the repo (e.g. /testbed/path/to/file.py)\n"
+                f"- MUST name specific functions or classes to work with\n"
+                f"- MUST specify what tool to use (read_file, write_file, apply_patch, run_bash)\n"
+                f"- For fix steps: describe the SPECIFIC code change needed, not just 'fix the bug'\n"
+                f"- Keep it concise but complete (2-5 sentences)\n\n"
+                f"Output ONLY the rewritten instruction text. No JSON, no markdown, no explanation."
+            )
+
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": refine_prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 512,
+            }
+
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=time_limit * 60)
+                resp.raise_for_status()
+                data = resp.json()
+                choices: List[Any] = data.get("choices") or [{}]
+                new_instruction = str(choices[0].get("message", {}).get("content", "") or "").strip()
+
+                if new_instruction and len(new_instruction) > 20:
+                    # Validate the refined instruction is actually better
+                    new_diag = self._instruction_quality_score(new_instruction, sub.name)
+                    if new_diag["score"] > diag["score"]:
+                        logger.info(
+                            f"[plan-refiner] Improved '{sub.name}' from score {diag['score']} to {new_diag['score']}"
+                        )
+                        refined[i] = SubAgent(
+                            name=sub.name,
+                            instruction=new_instruction,
+                            max_turns=sub.max_turns,
+                        )
+                    else:
+                        logger.warning(
+                            f"[plan-refiner] Refined instruction for '{sub.name}' not better "
+                            f"(old={diag['score']}, new={new_diag['score']}), keeping original"
+                        )
+            except Exception as e:
+                logger.warning(f"[plan-refiner] Failed to refine '{sub.name}': {e}")
+
+        return refined
+
+    # ------------------------------------------------------------------ #
+    #                       Plan Generation                                #
+    # ------------------------------------------------------------------ #
+
     def _generate_plan(
         self,
         instance: SWEbenchInstance,
@@ -853,11 +1194,14 @@ class ClaudeController:
         time_limit: int,
         model: str = "claude-sonnet-4-5-20250929",
     ) -> List[SubAgent]:
-        """Ask the LLM to generate a dynamic execution plan for this bug.
+        """Three-phase plan generation: explore → plan → validate & refine.
 
-        Calls the LLM once (no tools) with the bug description and expects a
-        JSON response containing a list of steps. Falls back to the default
-        4-step plan on any error.
+        Phase 1: Run targeted exploration commands in the container to discover
+                 repo structure, relevant source files, function signatures, and test files.
+        Phase 2: Feed the exploration results + bug description to the LLM planner
+                 so it can generate instructions with exact file paths and function names.
+        Phase 3: Programmatically validate each instruction for specificity. If any step
+                 is flagged as "vague", auto-refine it with a targeted LLM call.
 
         Args:
             instance: The SWE-bench instance.
@@ -866,15 +1210,22 @@ class ClaudeController:
             model: Model to use for the planning call.
 
         Returns:
-            List of SubAgent objects derived from the LLM's plan.
+            List of SubAgent objects derived from the LLM's plan, with vague
+            instructions refined to include concrete file paths and function names.
         """
+        # ===== Phase 1: Explore the repo to gather concrete context =====
+        repo_context = self._explore_repo_for_planning(instance, time_limit)
+
+        # ===== Phase 2: Generate plan with enriched context =====
         url = f"{self.endpoint}/chat/completions"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
 
         planning_user_prompt = (
             f"Bug description:\n{instance['problem_statement']}\n\n"
+            f"=== REPO EXPLORATION RESULTS ===\n{repo_context}\n\n"
             f"Total turn budget: {max_turns}.\n"
-            "Generate a focused execution plan. Output ONLY the JSON object."
+            "Generate a focused execution plan using the EXACT file paths and function names from the exploration above.\n"
+            "Output ONLY the JSON object."
         )
 
         payload = {
@@ -884,10 +1235,10 @@ class ClaudeController:
                 {"role": "user", "content": planning_user_prompt},
             ],
             "temperature": 0.0,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
         }
 
-        logger.info("[planner] Requesting dynamic plan from LLM...")
+        logger.info("[planner] Requesting dynamic plan from LLM with enriched context...")
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=time_limit * 60)
             resp.raise_for_status()
@@ -916,6 +1267,25 @@ class ClaudeController:
                 sub_agents.append(SubAgent(name=step_name, instruction=instruction, max_turns=mt))
 
             logger.info(f"[planner] Generated plan with {len(sub_agents)} steps: {[s.name for s in sub_agents]}")
+
+            # ===== Phase 3: Validate & refine =====
+            diagnostics = self._validate_plan_quality(sub_agents)
+            has_vague = any(d["is_vague"] for d in diagnostics)
+            if has_vague:
+                logger.info("[planner] Vague steps detected, running auto-refinement...")
+                sub_agents = self._refine_vague_instructions(
+                    sub_agents, diagnostics, repo_context, instance, time_limit, model
+                )
+                # Log final plan quality
+                final_diags = self._validate_plan_quality(sub_agents)
+                still_vague = sum(1 for d in final_diags if d["is_vague"])
+                if still_vague:
+                    logger.warning(f"[planner] {still_vague} steps still vague after refinement")
+                else:
+                    logger.info("[planner] All steps passed quality validation after refinement")
+            else:
+                logger.info("[planner] All steps passed quality validation on first pass")
+
             return sub_agents
 
         except Exception as e:
@@ -1077,7 +1447,7 @@ class ClaudeController:
 
             observation = self._collect_replan_observation()
             step_summaries.append(
-                f"[{step.name}] turns={turns_used}\nResult:\n{step.result[:500]}\nObservation:\n{observation[:500]}"
+                f"[{step.name}] turns={turns_used}\nResult:\n{step.result}\nObservation:\n{observation}"
             )
             self._log.emit(
                 type="step_observe",
