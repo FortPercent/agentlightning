@@ -418,8 +418,7 @@ class ClaudeController:
                         "PATCH\n"
                         f"(git apply --whitespace=nowarn -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)\n"
                         "ec=$?\n"
-                        "echo \"__AGL_APPLY_PATCH_EXIT_CODE__=$ec\"\n"
-                        "exit $ec"
+                        'echo "__AGL_APPLY_PATCH_EXIT_CODE__=$ec"'
                     )
                     out = container.send_command(cmd, timeout_default)
                     txt = out if isinstance(out, str) else getattr(out, "output", str(out))
@@ -438,7 +437,34 @@ class ClaudeController:
 
                     cleaned_txt = re.sub(r"\n?__AGL_APPLY_PATCH_EXIT_CODE__=\d+\s*$", "", txt).strip()
                     if exit_code == 0:
-                        return _ok(cleaned_txt, tool=name, strip=strip, tried_strips=strip_candidates)
+                        verify_out = container.send_command(
+                            "cd /testbed && git --no-pager diff --name-only",
+                            timeout_default,
+                        )
+                        verify_txt = (
+                            verify_out
+                            if isinstance(verify_out, str)
+                            else getattr(verify_out, "output", str(verify_out))
+                        )
+                        changed_files = [
+                            ln.strip()
+                            for ln in verify_txt.splitlines()
+                            if ln.strip() and not ln.strip().startswith("cd /testbed &&")
+                        ]
+                        if changed_files:
+                            return _ok(
+                                cleaned_txt,
+                                tool=name,
+                                strip=strip,
+                                tried_strips=strip_candidates,
+                                changed_files=changed_files[:50],
+                            )
+                        attempt_logs.append(
+                            f"[strip={strip} exit_code={exit_code} but no git diff]\n"
+                            f"apply_output:\n{cleaned_txt if cleaned_txt else '(no stderr/stdout output)'}\n\n"
+                            f"git diff --name-only output:\n{verify_txt.strip() if verify_txt.strip() else '(empty)'}"
+                        )
+                        continue
 
                     attempt_logs.append(
                         f"[strip={strip} exit_code={exit_code}]\n"
