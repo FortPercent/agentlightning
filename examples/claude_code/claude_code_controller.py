@@ -418,8 +418,7 @@ class ClaudeController:
                         "PATCH\n"
                         f"(git apply --whitespace=nowarn -p{strip} /tmp/agent.patch || patch -p{strip} < /tmp/agent.patch)\n"
                         "ec=$?\n"
-                        "echo \"__AGL_APPLY_PATCH_EXIT_CODE__=$ec\"\n"
-                        "exit $ec"
+                        "echo \"__AGL_APPLY_PATCH_EXIT_CODE__=$ec\""
                     )
                     out = container.send_command(cmd, timeout_default)
                     txt = out if isinstance(out, str) else getattr(out, "output", str(out))
@@ -1451,16 +1450,30 @@ class ClaudeController:
     def _collect_replan_observation(self) -> str:
         """Collect lightweight repo feedback after a step execution."""
         snippets: List[str] = []
+        # Combine git diff commands into a single send_command to avoid
+        # PS1 prompt corruption when the first command times out and its
+        # Ctrl+C residual output bleeds into the next command's matching.
+        combined_cmd = (
+            "cd /testbed && "
+            "echo '=== DIFF_STAT ===' && git --no-pager diff --stat 2>&1 | head -60 && "
+            "echo '=== DIFF_NAMES ===' && git --no-pager diff --name-only 2>&1 | head -60"
+        )
         try:
-            diff_stat = self.container.send_command("cd /testbed && git --no-pager diff --stat", timeout=30).output.strip()
-            snippets.append(f"git diff --stat:\n{diff_stat[:1200]}")
+            import time as _time
+            _time.sleep(0.3)  # let residual output from prior command drain
+            result = self.container.send_command(combined_cmd, timeout=30).output.strip()
+            # Split the combined output
+            if "=== DIFF_STAT ===" in result and "=== DIFF_NAMES ===" in result:
+                parts = result.split("=== DIFF_NAMES ===")
+                stat_part = parts[0].replace("=== DIFF_STAT ===", "").strip()
+                names_part = parts[1].strip() if len(parts) > 1 else ""
+                snippets.append(f"git diff --stat:\n{stat_part[:1200]}")
+                snippets.append(f"modified files:\n{names_part[:800]}")
+            else:
+                snippets.append(f"git diff output:\n{result[:2000]}")
         except Exception as e:
-            snippets.append(f"git diff --stat failed: {e}")
-        try:
-            diff_names = self.container.send_command("cd /testbed && git --no-pager diff --name-only", timeout=30).output.strip()
-            snippets.append(f"modified files:\n{diff_names[:800]}")
-        except Exception as e:
-            snippets.append(f"git diff --name-only failed: {e}")
+            logger.warning(f"_collect_replan_observation failed: {e}")
+            snippets.append(f"git diff failed: {e}")
         return "\n\n".join(snippets)
 
     def _generate_next_step(
